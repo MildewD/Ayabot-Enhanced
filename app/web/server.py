@@ -6346,7 +6346,7 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                         <div class="dm-toolbar-row flex items-start gap-3 px-3 py-2 flex-wrap">
                             <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">时间范围</span>
                             <div class="flex items-center gap-2 flex-wrap">
-                                <button @click="dmShowCal = !dmShowCal" class="border px-3 py-2 rounded text-sm bg-white hover:bg-gray-50">
+                                <button @click="dmToggleCal($event)" class="border px-3 py-2 rounded text-sm bg-white hover:bg-gray-50">
                                     {{ dmSelectedDates.size ? '已选 '+dmSelectedDates.size+' 天' : '点击选择日期' }}
                                     <span v-if="dmDateFrom && dmDateTo && dmDateFrom !== dmDateTo" class="text-gray-400 ml-1">({{ dmDateFrom }} ~ {{ dmDateTo }})</span>
                                     <span v-else-if="dmDateFrom" class="text-gray-400 ml-1">({{ dmDateFrom }})</span>
@@ -6445,11 +6445,19 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                             </div>
                         </div>
                     </div>
-                    <div v-if="dmShowCal" @click.stop class="absolute top-full left-0 mt-1 bg-white border rounded-xl shadow-lg z-50 p-3 w-[300px]">
+                    <Teleport to="body">
+                    <div v-if="dmShowCal" @click.stop class="cal-pop bg-white rounded-xl shadow-lg p-3 w-[320px]" :style="{position:'fixed', top:(dmCalPos.top)+'px', left:(dmCalPos.left)+'px', zIndex:2147483000}">
                         <div class="flex justify-between items-center mb-2">
-                            <button @click="dmCalMonth--" class="px-2 py-1 hover:bg-gray-100 rounded text-sm">&lt;</button>
+                            <button @click="dmCalMonth--" type="button" class="px-2 py-1 hover:bg-gray-100 rounded text-sm">&lt;</button>
                             <span class="text-sm font-bold">{{ dmCalYear }}年{{ dmCalMonth+1 }}月</span>
-                            <button @click="dmCalMonth++" class="px-2 py-1 hover:bg-gray-100 rounded text-sm">&gt;</button>
+                            <button @click="dmCalMonth++" type="button" class="px-2 py-1 hover:bg-gray-100 rounded text-sm">&gt;</button>
+                        </div>
+                        <div class="flex gap-1 mb-2">
+                            <button @click="dmSelectAllMonth" type="button" class="text-[10px] px-2 py-1 bg-blue-50 text-blue-600 rounded hover:bg-blue-100">全选当月</button>
+                            <button @click="dmClearDates" type="button" class="text-[10px] px-2 py-1 bg-gray-50 text-gray-500 rounded hover:bg-gray-100">清除</button>
+                            <button v-if="dmSelectedDates.size>=1" @click="dmCalOk" type="button" class="text-[10px] px-2 py-1 bg-green-50 text-green-600 rounded hover:bg-green-100 font-semibold ml-auto">
+                                确定（{{ dmSelectedDates.size }}天）
+                            </button>
                         </div>
                         <div class="grid grid-cols-7 gap-1 text-center text-xs mb-1">
                             <div class="text-gray-400 font-medium">日</div><div class="text-gray-400 font-medium">一</div><div class="text-gray-400 font-medium">二</div><div class="text-gray-400 font-medium">三</div><div class="text-gray-400 font-medium">四</div><div class="text-gray-400 font-medium">五</div><div class="text-gray-400 font-medium">六</div>
@@ -6457,19 +6465,18 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                         <div class="grid grid-cols-7 gap-1">
                             <template v-for="(day,i) in dmCalDays" :key="i">
                                 <div v-if="!day" class="h-8"></div>
-                                <button v-else :disabled="!day.hasData" @click="dmToggleDate(day.ymd)"
-                                        class="h-8 rounded text-xs transition"
-                                        :class="day.selected ? 'bg-blue-600 text-white font-bold ring-2 ring-blue-300' : (day.hasData ? 'bg-blue-100 text-blue-700 hover:bg-blue-200 cursor-pointer' : 'text-gray-300 cursor-not-allowed')">
+                                <button v-else type="button" :disabled="!day.hasData" @click="dmToggleDate(day.ymd)"
+                                        class="h-8 rounded text-xs transition relative"
+                                        :class="day.hasData
+                                            ? (day.selected ? 'bg-blue-500 text-white' : 'bg-blue-100 text-blue-700 hover:bg-blue-200 cursor-pointer')
+                                            : 'text-gray-300 cursor-not-allowed'">
                                     {{ day.d }}
                                 </button>
                             </template>
                         </div>
-                        <div class="flex justify-between mt-3 pt-2 border-t border-gray-100">
-                            <button @click="dmSelectedDates = new Set(); dmShowCal = false" class="text-xs text-gray-500 hover:text-gray-700">取消</button>
-                            <span class="text-[10px] text-gray-400 leading-5">蓝色=有数据，点击多选</span>
-                            <button @click="dmShowCal = false; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuSessions()" class="text-xs bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">✅ 确认</button>
-                        </div>
+                        <div class="text-[10px] text-gray-400 mt-2 text-center">蓝色 = 有数据，深蓝 = 已选中</div>
                     </div>
+                    </Teleport>
                 </div>
 
                 <div v-if="danmakuErr" class="text-red-500 text-sm">{{ danmakuErr }}</div>
@@ -7265,6 +7272,7 @@ createApp({
         const dmCalMonth = ref(new Date().getMonth());
         const dmSelectedDates = ref(new Set());
         const dmShowCal = ref(false);
+        const dmCalPos = ref({ top: 0, left: 0 }); // 日历弹窗定位（Teleport fixed）
         const dmDateFrom = ref('');
         const dmDateTo = ref('');
         const dmAsc = ref(false);
@@ -8558,6 +8566,37 @@ createApp({
             const s = new Set(dmSelectedDates.value);
             if (s.has(ymd)) s.delete(ymd); else s.add(ymd);
             dmSelectedDates.value = s;
+        }
+        // 日历弹窗开合并记录触发点视口坐标（Teleport 到 body 后需用 fixed 定位）
+        function dmToggleCal(ev) {
+            dmShowCal.value = !dmShowCal.value;
+            if (dmShowCal.value && ev && ev.currentTarget) {
+                const r = ev.currentTarget.getBoundingClientRect();
+                dmCalPos.value = { top: r.bottom + 4, left: r.left };
+            }
+        }
+        // 全选当月有数据的日期
+        function dmSelectAllMonth() {
+            const s = new Set(dmSelectedDates.value);
+            const y = dmCalYear.value, m = dmCalMonth.value;
+            const ymd = (d) => `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+            for (let d = 1; d <= new Date(y, m + 1, 0).getDate(); d++) {
+                const k = ymd(d);
+                if (dmDatesSet.value.has(k)) s.add(k);
+            }
+            dmSelectedDates.value = s;
+        }
+        // 清除所有选中日期
+        function dmClearDates() {
+            dmSelectedDates.value = new Set();
+        }
+        // 确定：关闭日历并按选中日期加载
+        function dmCalOk() {
+            dmShowCal.value = false;
+            danmakuOffset.value = 0;
+            dmSessionIdx.value = -1;
+            loadDanmakuLog();
+            loadDanmakuSessions();
         }
         async function loadDanmakuLog() {
             danmakuErr.value = '';
@@ -10069,7 +10108,7 @@ createApp({
                 roomApiEnabled, roomApiUrl, roomApiFullKey, roomApiBusy,
                 apiMsg, apiMsgOk, loadRoomApiConfig, toggleRoomApi, regenerateRoomApiKey, copyText,
                 danmakuRows, danmakuErr, danmakuOffset, danmakuLimit, danmakuTotal, danmakuPage,
-                loadDanmakuLog, clearDanmakuLog, fmtDanmakuTime, loadDmDates, dmToggleDate, dmExportSelected, dmCalDays, dmCalYear, dmCalMonth, dmShowCal, dmSelectedDates, dmDates, dmDatesSet, dmAsc,
+                loadDanmakuLog, clearDanmakuLog, fmtDanmakuTime, loadDmDates, dmToggleDate, dmToggleCal, dmSelectAllMonth, dmClearDates, dmCalOk, dmCalPos, dmExportSelected, dmCalDays, dmCalYear, dmCalMonth, dmShowCal, dmSelectedDates, dmDates, dmDatesSet, dmAsc,
                 dmKeyword, dmSearchActive, dmSearch, clearDmSearch, highlightDanmaku,
                 dmGap, dmShowRec, dmGapOptions, fmtRelTime, restartSessions,
                 dmUsers, dmUserFilter, dmUidFilter, dmUserBusy, dmStats, dmShowStats,

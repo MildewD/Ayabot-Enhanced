@@ -7810,6 +7810,7 @@ createApp({
                 await loadDmDates();
                 loadDanmakuLog();
                 loadDanmakuSessions();
+                loadDanmakuUsers();
             }
             if (key === 'export') {
                 loadUserDates();

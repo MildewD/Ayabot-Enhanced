@@ -6851,6 +6851,7 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                     <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#本月盲盒:用户名</code></td><td class="p-2 text-gray-600">本月盲盒统计，不加用户名查自己</td></tr>
                     <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#&lt;唤醒词&gt; &lt;聊天&gt;</code></td><td class="p-2 text-gray-600">AI 智能回复</td></tr>
                     <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#帮助</code></td><td class="p-2 text-gray-600">显示所有命令</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#PK已结束</code></td><td class="p-2 text-gray-600">手动复位 PK 状态（主播/房管）</td></tr>
                 </tbody>
             </table>
             </div>

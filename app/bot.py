@@ -169,9 +169,11 @@ class LiveRobot:
     async def _poll_once(self) -> None:
         is_live = await self._is_room_live()
         self._is_live = is_live
-        if is_live and self._danmaku is None:
+        # 开启 run_when_not_live 后，未开播也保持弹幕连接（用于测试）；默认仍按开播判断
+        keep_connected = self.config.features.run_when_not_live
+        if (is_live or keep_connected) and self._danmaku is None:
             await self._start_danmaku()
-        if (not is_live) and self._danmaku is not None:
+        if (not is_live) and (not keep_connected) and self._danmaku is not None:
             await self._stop_danmaku()
 
         self._poll_counter = (self._poll_counter + 1) % 10
@@ -546,8 +548,20 @@ class LiveRobot:
             return
 
         # 关注/分享由 _on_interact_word 通过 pb_decoded 处理
-        if not self.config.features.welcome_enabled:
-            return
+        # ── 入口闸门：默认欢迎与大航海欢迎是两个独立开关 ──
+        # 大航海用户（舰长/提督/总督）由 guard_welcome_enabled 控制，
+        # 普通用户由 welcome_enabled 控制。两者互不依赖：
+        #   - 只开大航海欢迎 → 仅欢迎舰长/提督/总督，普通用户不欢迎
+        #   - 只开默认欢迎 → 所有人走默认欢迎模板（大航海不再有专属模板）
+        is_guard = self._get_guard_level(event) > 0
+        if is_guard:
+            if not (self.config.features.guard_welcome_enabled or self.config.features.welcome_enabled):
+                return
+        else:
+            if not self.config.features.welcome_enabled:
+                return
+        # 是否使用大航海专属欢迎模板（守卫开关开启时）
+        use_guard_template = is_guard and self.config.features.guard_welcome_enabled
 
         # 使用全局锁串行化欢迎处理：B站通过 create_task 并发推送多个事件，
         # 必须确保同一 UID 的两次欢迎不会同时进入模板选择逻辑。
@@ -581,7 +595,7 @@ class LiveRobot:
                         # 旧版：直接的模板字符串
                         template = raw_tpl
 
-            if template is None:
+            if template is None and use_guard_template:
                 guard_level = self._get_guard_level(event)
                 if guard_level > 0:
                     self.logger.info("guard welcome: uid=%s uname=%s guard_level=%s", uid, uname, guard_level)
@@ -1281,6 +1295,15 @@ class LiveRobot:
             await self._enqueue_reply(text="欢迎词已更新", reply_uid=uid)
             return
 
+        if name == "pk_end":
+            if not self._in_pk:
+                await self._enqueue_reply(text="当前不在 PK 状态", reply_uid=uid)
+                return
+            self._in_pk = False
+            self.logger.info("PK state manually reset by uid=%s", uid)
+            await self._enqueue_reply(text="#PK已结束", reply_uid=uid)
+            return
+
     async def _on_all_events(self, event: dict[str, Any]) -> None:
         event_type = event.get("type", "?")
 
@@ -1293,9 +1316,17 @@ class LiveRobot:
             if ("BATTLE_START" in event_type or "PRE" in event_type) and not self._in_pk:
                 self._in_pk = True
                 await self._handle_pk_start(event)
-            elif "SETTLE" in event_type:
+            # PK 结束：SETTLE 自然结算 / END·OVER·FINISH·STOP 主动结束，都复位
+            elif ("SETTLE" in event_type or "END" in event_type
+                  or "OVER" in event_type or "FINISH" in event_type
+                  or "STOP" in event_type):
                 self._in_pk = False
-                await self._handle_pk_end(event)
+                if "SETTLE" in event_type:
+                    # 自然结算：走完整结果汇报（受 pk_end_report_enabled 控制）
+                    await self._handle_pk_end(event)
+                else:
+                    # 主动结束：B站无完整结算数据，只发一句 PK 已结束（不带 #，避免被解析为指令）
+                    await self._enqueue_message(text="PK已结束，状态已复位", reply_uid=None)
             elif "PROCESS" in event_type or "PUNISH" in event_type or event_type == "PK_INFO":
                 self.logger.debug("PK intermediate event ignored: %s", event_type)
             return
@@ -2031,6 +2062,10 @@ def _match_hash_command(s: str) -> Optional[tuple[str, str]]:
         return "welcome_off", ""
     if s.startswith("#welcome text "):
         return "welcome_text", s[len("#welcome text ") :].strip()
+
+    # ── 手动结束 PK（更新 PK 状态）──
+    if compact == "#PK已结束" or compact == "#pk已结束":
+        return "pk_end", ""
 
     return None
 

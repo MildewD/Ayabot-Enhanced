@@ -6856,6 +6856,8 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
             </div>
             <p class="text-xs text-gray-400 mt-2">开启「免#指令」后可不带 # 前缀触发指令。
             开启「AI免#前缀唤醒」后弹幕以唤醒词开头即触发 AI。</p>
+            <p class="text-xs text-gray-400 mt-2">
+            ⚔️ <strong class="text-gray-500">PK 状态播报</strong>：开启「PK 汇报」后，进入/PK 开始 → 机器人自动播报对手信息；PK <strong class="text-gray-500">主动停止</strong>（主播手动结束，无完整结算数据）→ 机器人同步复位 PK 状态并只播报一句「#PK已结束」；PK <strong class="text-gray-500">自然结算</strong> → 机器人播报输赢与双方比分。</p>
         </div>
     </div>
 </div>

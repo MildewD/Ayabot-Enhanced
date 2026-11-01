@@ -4951,6 +4951,8 @@ html.dark .dm-sess-picker .dm-sess-trigger .text-gray-800 { color: #f1f5f9 !impo
 .dm-sess-picker .absolute { z-index: 60; }
 .dm-sess-trigger .dm-arrow { color: #64748b; display: inline-flex; }
 html.dark .dm-sess-trigger .dm-arrow { color: #cbd5e1; }
+.dm-user-picker .dm-arrow { color: #64748b; }
+html.dark .dm-user-picker .dm-arrow { color: #cbd5e1; }
 html.dark .dm-sess-picker .absolute { background-color: #1e293b !important; border-color: rgba(71,85,105,0.35) !important; }
 html.dark .dm-sess-picker .absolute .border-gray-100 { border-color: rgba(71,85,105,0.25) !important; }
 html.dark .dm-sess-picker .absolute .border-b,
@@ -6460,11 +6462,16 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                         <div class="dm-toolbar-row flex items-start gap-3 px-3 py-2 flex-wrap">
                             <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">用户</span>
                             <div class="flex items-center gap-2 flex-wrap">
-                                <select v-model="dmUserFilter" @change="dmUidFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuUsers(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats();"
-                                        class="dm-field dm-select border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 max-w-[200px]" title="按用户名筛选(模糊)">
-                                    <option value="">全部用户</option>
-                                    <option v-for="u in dmUsers" :key="u.uid" :value="u.uname">{{ u.uname }} ({{ u.count }})</option>
-                                </select>
+                                <div class="relative dm-user-picker max-w-[200px]">
+                                    <select v-model="dmUserFilter" @change="dmUidFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuUsers(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats();"
+                                            class="dm-field dm-select appearance-none border px-2 py-2 pr-7 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 w-full cursor-pointer" title="按用户名筛选(模糊)">
+                                        <option value="">全部用户</option>
+                                        <option v-for="u in dmUsers" :key="u.uid" :value="u.uname">{{ u.uname }} ({{ u.count }})</option>
+                                    </select>
+                                    <span class="dm-arrow pointer-events-none absolute right-2 top-1/2 -translate-y-1/2" aria-hidden="true">
+                                        <svg width="10" height="10" viewBox="0 0 10 10" class="block"><path d="M1 3 L5 7 L9 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                    </span>
+                                </div>
                                 <input type="text" v-model="dmUidFilter" placeholder="UID 精确筛选"
                                        class="dm-field border px-2 py-2 rounded text-sm bg-white w-36 focus:outline-none focus:ring-2 focus:ring-blue-300"
                                        @keyup.enter="dmUserFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats()">

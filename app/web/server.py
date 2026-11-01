@@ -7795,7 +7795,7 @@ createApp({
             editRoomConfig(selectedRoom?.value?.room_id);
             setTimeout(loadLlmConfig, 300);
         }
-        function selectRoomSubTab(key) {
+        async function selectRoomSubTab(key) {
             roomSubTab.value = key;
             if ((key === 'config' || key === 'llm') && selectedRoom.value) {
                 editRoomConfig(selectedRoom.value.room_id);
@@ -7807,7 +7807,7 @@ createApp({
             if (key === 'danmaku') {
                 danmakuOffset.value = 0;
                 dmSelectedDates.value = new Set();
-                loadDmDates();
+                await loadDmDates();
                 loadDanmakuLog();
                 loadDanmakuSessions();
             }
@@ -8547,6 +8547,10 @@ createApp({
                 if (!r.ok) return;
                 dmDates.value = await r.json();
                 dmDatesSet.value = new Set(dmDates.value);
+                // 默认仅显示最新一天（dmDates 为升序，最后一项即最新）；未选日期时才默认
+                if (dmSelectedDates.value.size === 0 && dmDates.value.length) {
+                    dmSelectedDates.value = new Set([dmDates.value[dmDates.value.length-1]]);
+                }
             } catch(e) { /* ignore */ }
         }
         function dmToggleDate(ymd) {

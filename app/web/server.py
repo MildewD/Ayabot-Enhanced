@@ -4810,6 +4810,28 @@ html.dark .dm-toolbar input::placeholder { color: #64748b !important; }
 .dm-toolbar select[class*="border"] option { color: #1e293b; background-color: #ffffff; }
 html.dark .dm-toolbar select[class*="border"] { color: #f1f5f9 !important; background-color: #1e293b !important; }
 html.dark .dm-toolbar select[class*="border"] option { color: #f1f5f9; background-color: #1e293b; }
+/* ── 工具区统一搜索/下拉/UID 字段玻璃样式（与 时间范围/场次 控件配色统一） ── */
+.dm-toolbar .dm-field {
+    background: rgba(255,255,255,0.85) !important; border-color: rgba(148,163,184,0.40) !important;
+    border-radius: 0.55rem !important; color: #1e293b !important;
+    box-shadow: 0 1px 3px rgba(148,163,184,0.10);
+    transition: all .16s ease;
+}
+.dm-toolbar .dm-field:hover { border-color: rgba(99,102,241,0.5); }
+.dm-toolbar .dm-field:focus {
+    border-color: #6366f1 !important; box-shadow: 0 0 0 3px rgba(99,102,241,0.15) !important; outline: none;
+}
+html.dark .dm-toolbar .dm-field {
+    background: rgba(30,41,59,0.75) !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+html.dark .dm-toolbar .dm-field:focus { border-color: #818cf8 !important; box-shadow: 0 0 0 3px rgba(129,140,248,0.2) !important; }
+html.dark .dm-toolbar input.dm-field::placeholder { color: #64748b !important; }
+/* 覆盖 select 特判白底/深底，使红框下拉与黄框控件同源 */
+.dm-toolbar .dm-field.dm-select { color: #1e293b !important; background-color: rgba(255,255,255,0.85) !important; }
+.dm-toolbar .dm-field.dm-select option { color: #1e293b; background-color: #ffffff; }
+html.dark .dm-toolbar .dm-field.dm-select { color: #e2e8f0 !important; background-color: rgba(30,41,59,0.75) !important; }
+html.dark .dm-toolbar .dm-field.dm-select option { color: #e2e8f0; background-color: #1e293b; }
 /* ── 弹幕记录整体美化（日间玻璃拟态） ── */
 /* 工具区分组标签：渐变胶囊 + 柔光 */
 .dm-toolbar-label {
@@ -6408,14 +6430,14 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                             <div class="flex items-center gap-2 flex-wrap">
                                 <div class="flex items-center gap-1">
                                     <input type="text" v-model="dmKeyword" placeholder="🔍 搜索用户名/内容"
-                                           class="border p-2 rounded text-sm w-52 bg-white focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                           class="dm-field border p-2 rounded text-sm w-52 bg-white focus:outline-none focus:ring-2 focus:ring-blue-300"
                                            @keyup.enter="dmSearch" @keyup.esc="clearDmSearch">
                                     <button @click="dmSearch" class="bg-blue-500 hover:bg-blue-600 text-white px-3 py-2 rounded text-sm whitespace-nowrap">搜索</button>
                                     <button v-if="dmSearchActive" @click="clearDmSearch" class="px-2 py-2 rounded text-sm text-gray-500 hover:bg-gray-100" title="清除搜索">✕</button>
                                 </div>
                                 <div class="flex items-center gap-2 pl-2 border-l border-gray-200">
                                     <span class="text-xs text-gray-400">相邻弹幕间隔更大</span>
-                                    <select v-model="dmGap" @change="restartSessions" class="border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300" title="两条相邻弹幕间隔超过该时长即视为新的一场录像">
+                                    <select v-model="dmGap" @change="restartSessions" class="dm-field dm-select border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300" title="两条相邻弹幕间隔超过该时长即视为新的一场录像">
                                         <option v-for="o in dmGapOptions" :key="o.v" :value="o.v">{{ o.label }}</option>
                                     </select>
                                     <span class="text-xs text-gray-400">算新录像</span>
@@ -6430,12 +6452,12 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                             <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">用户</span>
                             <div class="flex items-center gap-2 flex-wrap">
                                 <select v-model="dmUserFilter" @change="dmUidFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuUsers(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats();"
-                                        class="border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 max-w-[200px]" title="按用户名筛选(模糊)">
+                                        class="dm-field dm-select border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 max-w-[200px]" title="按用户名筛选(模糊)">
                                     <option value="">全部用户</option>
                                     <option v-for="u in dmUsers" :key="u.uid" :value="u.uname">{{ u.uname }} ({{ u.count }})</option>
                                 </select>
                                 <input type="text" v-model="dmUidFilter" placeholder="UID 精确筛选"
-                                       class="border px-2 py-2 rounded text-sm bg-white w-36 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                       class="dm-field border px-2 py-2 rounded text-sm bg-white w-36 focus:outline-none focus:ring-2 focus:ring-blue-300"
                                        @keyup.enter="dmUserFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats()">
                                 <button v-if="dmUserFilter || dmUidFilter" @click="clearDmFilters" class="px-2 py-1.5 rounded text-xs text-gray-500 hover:bg-gray-100" title="清除用户/UID筛选">✕</button>
                                 <button @click="dmShowStats = !dmShowStats; if(dmShowStats) loadDanmakuStats()"

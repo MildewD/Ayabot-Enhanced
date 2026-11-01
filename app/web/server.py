@@ -6821,11 +6821,11 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
             <span class="hidden sm:inline text-xs text-blue-500 whitespace-nowrap shrink-0">打开 ↗</span>
         </a>
         <!-- 本版本链接：与官网卡片同样式 -->
-        <a href="https://github.com/MildewD/Ayabot_2" target="_blank" rel="noopener"
+        <a href="https://github.com/MildewD/Ayabot-Enhanced" target="_blank" rel="noopener"
            class="flex items-center gap-3 bg-gradient-to-r from-pink-50 to-sky-50 border border-pink-200 rounded-lg p-3 hover:border-pink-300 transition no-underline">
             <span class="text-2xl shrink-0">🌐</span>
             <span class="flex-1 min-w-0">
-                <span class="block font-bold text-[13px] sm:text-sm text-gray-800 break-words">本版本 · github.com/MildewD/Ayabot_2</span>
+                <span class="block font-bold text-[13px] sm:text-sm text-gray-800 break-words">本版本 · github.com/MildewD/Ayabot-Enhanced</span>
                 <span class="block text-xs text-gray-500 mt-0.5">本版本源码、功能说明、常见问题</span>
             </span>
             <span class="hidden sm:inline text-xs text-blue-500 whitespace-nowrap shrink-0">打开 ↗</span>

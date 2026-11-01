@@ -4832,6 +4832,13 @@ html.dark .dm-toolbar input.dm-field::placeholder { color: #64748b !important; }
 .dm-toolbar .dm-field.dm-select option { color: #1e293b; background-color: #ffffff; }
 html.dark .dm-toolbar .dm-field.dm-select { color: #e2e8f0 !important; background-color: rgba(30,41,59,0.75) !important; }
 html.dark .dm-toolbar .dm-field.dm-select option { color: #e2e8f0; background-color: #1e293b; }
+/* 顶栏 B站账号 等通用 dm-field 控件（非 dm-toolbar 内）夜间配色，与工具区同源 */
+.dm-field { border-radius: 0.55rem; transition: all .16s ease; }
+html.dark .dm-field {
+    background-color: rgba(30,41,59,0.75) !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important;
+}
+html.dark .dm-field option { color: #e2e8f0; background-color: #1e293b; }
+html.dark .dm-field:focus { border-color: #818cf8 !important; box-shadow: 0 0 0 3px rgba(129,140,248,0.2) !important; outline: none; }
 /* ── 弹幕记录整体美化（日间玻璃拟态） ── */
 /* 工具区分组标签：渐变胶囊 + 柔光 */
 .dm-toolbar-label {
@@ -5252,7 +5259,7 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
             </div>
             <div class="flex items-center gap-2 flex-wrap shrink-0" v-show="userRole === 'admin'">
                 <span class="text-xs text-gray-500 whitespace-nowrap">B站账号:</span>
-                <select v-model="selectedRoomAccount" class="border p-1.5 rounded text-sm flex-1 sm:flex-none min-w-0 max-w-[150px] sm:max-w-none">
+                <select v-model="selectedRoomAccount" class="dm-field border p-1.5 rounded text-sm flex-1 sm:flex-none min-w-0 max-w-[150px] sm:max-w-none">
                     <option value="">不关联</option>
                     <option v-for="a in accounts" :key="a.uid" :value="a.uid">{{ a.nickname || 'UID:'+a.uid }}</option>
                 </select>

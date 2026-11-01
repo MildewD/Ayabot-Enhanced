@@ -4866,6 +4866,53 @@ html.dark .dm-table-wrap { background: rgba(15,23,42,0.45); border-color: rgba(7
 html.dark .dm-table-wrap .gb-table tbody tr { box-shadow: inset 0 -1px 0 rgba(71,85,105,0.2); }
 html.dark .dm-stats-card { background: rgba(15,23,42,0.5); border-color: rgba(71,85,105,0.3); }
 html.dark .dm-stats-card .bg-gray-100 { background-color: rgba(30,41,59,0.8) !important; }
+/* ── AI回复(llm) 设置页美化覆盖 ── */
+.llm-card {
+    background: linear-gradient(180deg, rgba(255,255,255,0.78), rgba(248,250,252,0.58)) !important;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(226,232,240,0.9) !important;
+    box-shadow: 0 6px 20px rgba(148,163,184,0.10);
+    position: relative; z-index: 20; isolation: isolate;
+}
+.llm-card label { color: #475569; font-weight: 500; }
+.llm-card input[class*="border"], .llm-card select[class*="border"], .llm-card textarea[class*="border"] {
+    background: rgba(255,255,255,0.7); border-color: rgba(226,232,240,0.9) !important;
+    border-radius: 0.6rem !important; color: #1e293b; box-shadow: 0 1px 2px rgba(148,163,184,0.06);
+    transition: all .16s ease;
+}
+.llm-card input[class*="border"]:focus, .llm-card select[class*="border"]:focus, .llm-card textarea[class*="border"]:focus {
+    border-color: #6366f1 !important; box-shadow: 0 0 0 3px rgba(99,102,241,0.15) !important; outline: none;
+}
+.llm-card .llm-code { background: rgba(99,102,241,0.10) !important; color: #6366f1 !important; font-weight: 600; }
+.llm-card .llm-chip { backdrop-filter: blur(4px); border: 1px solid rgba(226,232,240,0.6); }
+.llm-card hr { border-color: rgba(226,232,240,0.6); }
+/* 夜间适配 */
+html.dark .llm-card {
+    background: linear-gradient(180deg, rgba(30,41,59,0.7), rgba(15,23,42,0.58)) !important;
+    border-color: rgba(71,85,105,0.35) !important;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.28);
+}
+html.dark .llm-card label { color: #cbd5e1 !important; }
+html.dark .llm-card input[class*="border"], html.dark .llm-card select[class*="border"], html.dark .llm-card textarea[class*="border"] {
+    background: rgba(15,23,42,0.7) !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important;
+}
+html.dark .llm-card input::placeholder, html.dark .llm-card textarea::placeholder { color: #64748b !important; }
+html.dark .llm-card .llm-code { background: rgba(99,102,241,0.22) !important; color: #c7d2fe !important; }
+html.dark .llm-card .llm-chip { border-color: rgba(71,85,105,0.4) !important; }
+html.dark .llm-card .bg-gray-50 { background-color: rgba(51,65,85,0.6) !important; color: #cbd5e1 !important; }
+html.dark .llm-card .text-gray-500 { color: #94a3b8 !important; }
+html.dark .llm-card .text-gray-400 { color: #94a3b8 !important; }
+html.dark .llm-card h2, html.dark .llm-card h3, html.dark .llm-card .text-sm.font-bold { color: #e2e8f0 !important; }
+html.dark .llm-card hr { border-color: rgba(71,85,105,0.3) !important; }
+/* 魔搭提示框夜间 */
+html.dark .llm-card div[class*="border-amber-200"] { background-color: rgba(113,63,18,0.35) !important; border-color: rgba(217,119,6,0.35) !important; color: #fbbf24 !important; }
+html.dark .llm-card div[class*="border-amber-200"] .text-amber-800, html.dark .llm-card div[class*="border-amber-200"] .text-amber-700 { color: #fdba74 !important; }
+html.dark .llm-card div[class*="border-amber-200"] .text-emerald-700 { color: #86efac !important; }
+html.dark .llm-card div[class*="border-amber-200"] code.bg-white { background-color: rgba(30,41,59,0.8) !important; color: #fbbf24 !important; }
+html.dark .llm-card div[class*="border-amber-200"] a.bg-white { background-color: rgba(30,41,59,0.8) !important; border-color: rgba(71,85,105,0.4) !important; color: #fbbf24 !important; }
+html.dark .llm-card button[class*="bg-green-500"], html.dark .llm-card button[class*="bg-orange-500"], html.dark .llm-card button[class*="bg-purple-500"] { filter: brightness(1.15); }
+html.dark .llm-card .border-amber-300 { border-color: rgba(217,119,6,0.5) !important; }
+html.dark .llm-card a[class*="border-amber-300"]:hover { background-color: rgba(198,90,25,0.3) !important; }
 /* ── 可搜索场次选择器面板 ── */
 .dm-sess-picker .dm-sess-trigger { min-width: 11rem; text-align: left; }
 .dm-sess-picker .dm-sess-trigger .text-gray-800 { color: #1e293b; }
@@ -5455,14 +5502,14 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
 
         <!-- AI 回复 -->
         <div v-if="roomSubTab==='llm'" class="max-w-full sm:max-w-2xl mx-auto">
-            <div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm space-y-4">
-                <h2 class="text-lg font-bold">🤖 AI 回复设置</h2>
-                <p class="text-xs text-gray-400 mb-2">用户发送 <code class="bg-gray-100 px-1 rounded">#{{ llmWakeWord || 'ayabot' }} &lt;聊天内容&gt;</code> 时调用 LLM API 自动回复。</p>
+            <div class="llm-card p-4 sm:p-6 rounded-xl space-y-4">
+                <h2 class="gb-card-title text-lg font-bold">🤖 AI 回复设置</h2>
+                <p class="text-xs text-gray-400 mb-2">用户发送 <code class="llm-code px-1 rounded">#{{ llmWakeWord || 'ayabot' }} &lt;聊天内容&gt;</code> 时调用 LLM API 自动回复。</p>
                 <div class="flex flex-wrap gap-1 mb-3 text-xs">
                     <span class="text-gray-500 mr-1">当前触发模式：</span>
-                    <span class="bg-blue-50 px-2 py-0.5 rounded">#唤醒词</span>
-                    <span v-if="roomConfig?.features?.llm_bare_trigger" class="bg-green-50 px-2 py-0.5 rounded">唤醒词开头</span>
-                    <span v-if="roomConfig?.features?.llm_bare_trigger && roomConfig?.features?.llm_keyword_trigger" class="bg-purple-50 px-2 py-0.5 rounded">含唤醒词触发</span>
+                    <span class="llm-chip bg-blue-50 px-2 py-0.5 rounded">#唤醒词</span>
+                    <span v-if="roomConfig?.features?.llm_bare_trigger" class="llm-chip bg-green-50 px-2 py-0.5 rounded">唤醒词开头</span>
+                    <span v-if="roomConfig?.features?.llm_bare_trigger && roomConfig?.features?.llm_keyword_trigger" class="llm-chip bg-purple-50 px-2 py-0.5 rounded">含唤醒词触发</span>
                     <span v-if="!roomConfig?.features?.llm_bare_trigger && !roomConfig?.features?.llm_keyword_trigger" class="text-gray-400">仅 #唤醒词</span>
                 </div>
 

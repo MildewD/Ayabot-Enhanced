@@ -4949,6 +4949,8 @@ html.dark .dm-sess-picker .dm-sess-trigger { color: #f1f5f9 !important; backgrou
 html.dark .dm-sess-picker .dm-sess-trigger .text-gray-400 { color: #94a3b8 !important; }
 html.dark .dm-sess-picker .dm-sess-trigger .text-gray-800 { color: #f1f5f9 !important; }
 .dm-sess-picker .absolute { z-index: 60; }
+.dm-sess-trigger .dm-arrow { color: #64748b; display: inline-flex; }
+html.dark .dm-sess-trigger .dm-arrow { color: #cbd5e1; }
 html.dark .dm-sess-picker .absolute { background-color: #1e293b !important; border-color: rgba(71,85,105,0.35) !important; }
 html.dark .dm-sess-picker .absolute .border-gray-100 { border-color: rgba(71,85,105,0.25) !important; }
 html.dark .dm-sess-picker .absolute .border-b,
@@ -6478,11 +6480,13 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                             <div class="flex items-center gap-2 flex-wrap">
                                 <div class="relative dm-sess-picker">
                                     <button @click.prevent="dmToggleSessionPanel"
-                                            class="dm-sess-trigger border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 whitespace-nowrap"
+                                            class="dm-sess-trigger dm-field border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 whitespace-nowrap"
                                             title="搜索并选择某一场直播查看其弹幕,替代按日期选择">
                                         <span v-if="dmSessionIdx < 0" class="text-gray-400">全部(按日期)</span>
                                         <span v-else class="text-gray-800">{{ dmSessCurLabel }}</span>
-                                        <span class="text-gray-400 ml-1">▾</span>
+                                        <span class="dm-arrow ml-1" aria-hidden="true">
+                                            <svg width="10" height="10" viewBox="0 0 10 10" class="inline-block align-baseline"><path d="M1 3 L5 7 L9 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                                        </span>
                                     </button>
                                     <!-- 可搜索场次列表面板 -->
                                     <div v-if="dmShowSessionPanel"

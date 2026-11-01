@@ -4764,6 +4764,19 @@ html.dark .bg-white.rounded-xl.shadow-lg .bg-gray-50 { background-color: rgba(30
 html.dark .bg-white.rounded-xl.shadow-lg input[class*="border"], html.dark .bg-white.rounded-xl.shadow-lg select[class*="border"], html.dark .bg-white.rounded-xl.shadow-lg textarea[class*="border"] {
     background-color: rgba(15,23,42,0.6) !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important;
 }
+/* 精美导出日期选择 日历弹窗（Teleport 到 body，.cal-pop）夜间适配 */
+html.dark .cal-pop { background-color: #101a2c !important; border-color: rgba(71,85,105,0.4) !important; box-shadow: 0 20px 50px rgba(0,0,0,0.6) !important; }
+html.dark .cal-pop .text-sm.font-bold { color: #e2e8f0 !important; }
+html.dark .cal-pop button[class*="hover:bg-gray-100"] { color: #cbd5e1 !important; }
+html.dark .cal-pop .bg-blue-50 { background-color: rgba(59,130,246,0.18) !important; color: #93c5fd !important; }
+html.dark .cal-pop .bg-gray-50 { background-color: rgba(51,65,85,0.45) !important; color: #cbd5e1 !important; border-color: rgba(71,85,105,0.3) !important; }
+html.dark .cal-pop .bg-green-50 { background-color: rgba(22,101,52,0.35) !important; color: #86efac !important; }
+html.dark .cal-pop .text-gray-400 { color: #94a3b8 !important; }
+html.dark .cal-pop .text-gray-300 { color: #64748b !important; }
+html.dark .cal-pop .bg-blue-100 { background-color: rgba(30,58,138,0.4) !important; color: #bfdbfe !important; }
+html.dark .cal-pop .bg-blue-100:hover { background-color: rgba(30,58,138,0.6) !important; }
+html.dark .cal-pop .bg-blue-500 { background-color: #2563eb !important; color: #fff !important; }
+html.dark .cal-pop .bg-blue-500:hover { background-color: #2563eb !important; }
 /* ── 弹幕记录工具区分组卡片（dm-toolbar）夜间适配 ── */
 html.dark .dm-toolbar { background-color: rgba(30,41,59,0.6) !important; border-color: rgba(71,85,105,0.3) !important; }
 html.dark .dm-toolbar .divide-y > * + * { border-color: rgba(71,85,105,0.25) !important; }
@@ -5292,8 +5305,9 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                         <div class="relative">
                             <input type="text" readonly :value="eDateLabel" placeholder="点击选择日期"
                                    class="border p-2 rounded w-full text-sm mt-0.5 cursor-pointer bg-white"
-                                   @click="showCalendar = !showCalendar">
-                            <div v-if="showCalendar" @click.stop class="absolute top-full left-0 mt-1 bg-white border rounded-xl shadow-lg z-50 p-3 w-[320px]">
+                                   @click="toggleCalendar($event)">
+                            <Teleport to="body">
+                            <div v-if="showCalendar" @click.stop class="cal-pop bg-white rounded-xl shadow-lg p-3 w-[320px]" :style="{position:'fixed', top:(calPos.top)+'px', left:(calPos.left)+'px', zIndex:2147483000}">
                                 <div class="flex justify-between items-center mb-2">
                                     <button @click="calMonth--" type="button" class="px-2 py-1 hover:bg-gray-100 rounded text-sm">&lt;</button>
                                     <span class="text-sm font-bold">{{ calYear }}年{{ calMonth+1 }}月</span>
@@ -5331,6 +5345,7 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
                                 </div>
                                 <div class="text-[10px] text-gray-400 mt-2 text-center">蓝色 = 有数据，深蓝 = 已选中</div>
                             </div>
+                            </Teleport>
                         </div>
                     </label>
                     <select v-model="eType" class="border p-2 rounded text-sm h-[38px]">
@@ -7084,6 +7099,15 @@ createApp({
         const calYear = ref(new Date().getFullYear());
         const calMonth = ref(new Date().getMonth());
         const exportDatesSet = ref(new Set());
+        // 日历弹窗定位：Teleport 到 body 后需用视口坐标 (fixed)。点击输入框时记录其位置
+        const calPos = ref({ top: 0, left: 0 });
+        const toggleCalendar = (ev) => {
+          showCalendar.value = !showCalendar.value;
+          if (showCalendar.value && ev && ev.currentTarget) {
+            const r = ev.currentTarget.getBoundingClientRect();
+            calPos.value = { top: r.bottom + 4, left: r.left };
+          }
+        };
 
         // 日历天数计算
         const calDays = Vue.computed(() => {
@@ -10031,7 +10055,7 @@ createApp({
                 toggleDate, selectAllDatesInRange, clearSelectedDates, applyMultiDateExport,
                 pickDate, captureExport, eModeAll, eSelectedDates, eSelectedSet,
                 eMergeGifts, eMergeUser, eShowPrice, exporting, startingRooms, fmtDateTime,
-                showCalendar, calYear, calMonth, calDays, exportDatesSet,
+                showCalendar, calYear, calMonth, calDays, exportDatesSet, calPos, toggleCalendar,
                 proxyImg, fmtTime, cardBgClass, guardLabel, guardBadgeClass,
                 delDate, delResult, confirmDelete,
                 roomApiEnabled, roomApiUrl, roomApiFullKey, roomApiBusy,

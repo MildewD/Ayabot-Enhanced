@@ -3512,6 +3512,20 @@ async def api_room_export_all(
             ORDER BY ts ASC
         """, params)
         rows = cur.fetchall()
+
+        # ══ 大航海兜底：用上舰记录 guard_events 反查每个 UID 的真实大航海等级 ══
+        # 礼物事件 raw_json 的 sender_uinfo.guard / medal.guard_level 只有少数记录会携带，
+        # 大量舰长/提督/总督送礼时该字段为空 → 被误判 guard_level=0，导出图鉴就只显示
+        # 个别大航海徽章。guard_events 按 (uid,start_time) 去重的是权威上舰记录，用它兜底。
+        guard_level_fallback: dict[int, int] = {}
+        try:
+            cur.execute(
+                "SELECT uid, MAX(guard_level) AS lvl FROM guard_events WHERE guard_level > 0 GROUP BY uid"
+            )
+            for g_uid, g_lvl in cur.fetchall():
+                guard_level_fallback[int(g_uid)] = int(g_lvl or 0)
+        except Exception:
+            guard_level_fallback = {}
         conn.close()
 
         import json as _json
@@ -3536,17 +3550,29 @@ async def api_room_export_all(
                 actual_value = round(actual_value / 10.0, 2)
 
             if raw:
+                # ── 兼容两种归一化结构 ──
+                # 旧协议 SEND_GIFT：字段嵌套在 sender_uinfo.base / .guard / .medal 里
                 sender_info = raw.get("sender_uinfo", {}) or {}
                 base = sender_info.get("base", {}) or {}
-                avatar = base.get("face", "") or ""
+                avatar = base.get("face", "") or raw.get("face", "") or ""
                 guard_info = sender_info.get("guard", {}) or None
                 if guard_info:
                     guard_level = guard_info.get("level", 0) or 0
+                # 新协议 SEND_GIFT_V2：guard_level / medal_info 在顶层
+                if not guard_level and raw.get("guard_level"):
+                    guard_level = int(raw.get("guard_level") or 0)
                 medal = sender_info.get("medal", {}) or None
                 if medal and not guard_level:
                     guard_level = medal.get("guard_level", 0) or 0
+                if not guard_level:
+                    medal2 = raw.get("medal_info", {}) or {}
+                    guard_level = int(medal2.get("guard_level", 0) or 0)
                 gift_info = raw.get("gift_info", {}) or {}
                 gift_icon = gift_info.get("img_basic", "") or gift_info.get("webp", "") or ""
+
+            # 事件 payload 里没带大航海信息 → 用上舰记录兜底
+            if not guard_level:
+                guard_level = guard_level_fallback.get(int(r[0]), 0)
 
             batch_key = r[8] and _json.loads(r[8]).get("batch_combo_id", "") or ""
             merge_key = (r[0], batch_key, r[2])  # (uid, batch_combo_id, gift_name)
@@ -3636,19 +3662,100 @@ def _clean_orphan_monthly_stats(db_path: Path) -> None:
 
 
 @app.get("/api/danmaku_log")
-async def api_get_danmaku_log(room_id: str = "", limit: int = 50, offset: int = 0, date_from: str = "", date_to: str = "", asc: int = 1):
+async def api_get_danmaku_log(room_id: str = "", limit: int = 50, offset: int = 0, date_from: str = "", date_to: str = "", asc: int = 1, keyword: str = "", gap_sec: int = 14400, start_ts: str = "", end_ts: str = "", uid: str = "", uname: str = ""):
     try:
         db_path = _room_db_path(room_id) if room_id else Path(_DB_PATH)
         if not db_path.exists():
             return {"rows": [], "total": 0}
         from app.storage import StatsStore
         store = StatsStore(str(db_path))
-        rows = store.get_danmaku_log(limit=limit, offset=offset, date_from=date_from, date_to=date_to, asc=bool(asc))
-        total = store.get_danmaku_log_count(date_from=date_from, date_to=date_to)
+        rows = store.get_danmaku_log(limit=limit, offset=offset, date_from=date_from, date_to=date_to, asc=bool(asc), keyword=keyword, start_ts=start_ts, end_ts=end_ts, uid=uid, uname=uname)
+        total = store.get_danmaku_log_count(date_from=date_from, date_to=date_to, keyword=keyword, start_ts=start_ts, end_ts=end_ts, uid=uid, uname=uname)
+        # 录像/场次划分：按相邻弹幕时间间隔 >= gap_sec 切分为多段（一段=一场直播/一个录像）
+        try:
+            ts_list = store.get_danmaku_ts_list(date_from=date_from, date_to=date_to, keyword=keyword, start_ts=start_ts, end_ts=end_ts, uid=uid, uname=uname)
+            sessions = []
+            for ts in ts_list:
+                if not sessions or ts - sessions[-1]["end"] >= max(1, gap_sec):
+                    sessions.append({"start": ts, "end": ts})
+                else:
+                    sessions[-1]["end"] = ts
+            def _sess_of(ts):
+                # 线性查找（会话数通常很少）
+                idx = 0
+                for s in sessions:
+                    if s["start"] <= ts <= s["end"]:
+                        return idx, s
+                    idx += 1
+                # 兜底：找最近 不大于 ts 的 end
+                best = None; bi = 0
+                for i, s in enumerate(sessions):
+                    if s["start"] <= ts:
+                        best = s; bi = i
+                return bi, best
+            for r in rows:
+                ts = r.get("ts")
+                idx, s = _sess_of(ts)
+                r["sess"] = idx + 1
+                r["sess_start"] = s["start"]
+                r["rel"] = max(0, ts - s["start"])
+        except Exception as exc:
+            logger.exception("danmaku session split failed")
         store.close()
         return {"rows": rows, "total": total}
     except Exception as exc:
         logger.exception("danmaku_log get failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/danmaku_users")
+async def api_get_danmaku_users(room_id: str = "", date_from: str = "", date_to: str = "", keyword: str = "", start_ts: str = "", end_ts: str = "", uid: str = "", uname: str = ""):
+    """返回弹幕对应的去重用户列表（按发言次数降序），供前端用户筛选下拉使用。"""
+    try:
+        db_path = _room_db_path(room_id) if room_id else Path(_DB_PATH)
+        if not db_path.exists():
+            return {"users": []}
+        from app.storage import StatsStore
+        store = StatsStore(str(db_path))
+        users = store.get_danmaku_users(date_from=date_from, date_to=date_to, keyword=keyword, start_ts=start_ts, end_ts=end_ts, uid=uid, uname=uname)
+        store.close()
+        return {"users": users}
+    except Exception as exc:
+        logger.exception("danmaku_users get failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/danmaku_stats")
+async def api_get_danmaku_stats(room_id: str = "", date_from: str = "", date_to: str = "", keyword: str = "", start_ts: str = "", end_ts: str = "", uid: str = "", uname: str = ""):
+    """返回弹幕统计：总条数 / 去重用户数 / 发言TOP10 / 逐小时分布。"""
+    try:
+        db_path = _room_db_path(room_id) if room_id else Path(_DB_PATH)
+        if not db_path.exists():
+            return {"stats": None}
+        from app.storage import StatsStore
+        store = StatsStore(str(db_path))
+        stats = store.get_danmaku_stats(date_from=date_from, date_to=date_to, keyword=keyword, start_ts=start_ts, end_ts=end_ts, uid=uid, uname=uname)
+        store.close()
+        return {"stats": stats}
+    except Exception as exc:
+        logger.exception("danmaku_stats get failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/danmaku_sessions")
+async def api_get_danmaku_sessions(room_id: str = "", date_from: str = "", date_to: str = "", keyword: str = "", start_ts: str = "", end_ts: str = "", uid: str = "", uname: str = "", gap_sec: int = 14400):
+    """返回筛选集合下按相邻时间间隔切分的直播场次列表，供前端「按场次查看」下拉使用。"""
+    try:
+        db_path = _room_db_path(room_id) if room_id else Path(_DB_PATH)
+        if not db_path.exists():
+            return {"sessions": []}
+        from app.storage import StatsStore
+        store = StatsStore(str(db_path))
+        sessions = store.get_danmaku_sessions(date_from=date_from, date_to=date_to, keyword=keyword, start_ts=start_ts, end_ts=end_ts, uid=uid, uname=uname, gap_sec=gap_sec)
+        store.close()
+        return {"sessions": sessions}
+    except Exception as exc:
+        logger.exception("danmaku_sessions get failed")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -4302,8 +4409,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://unpkg.com/modern-screenshot@4.7.0/dist/index.js"></script>
+<script>
+// ── 夜间模式：页面加载前立即应用，避免闪烁 ──
+(function () {
+  try {
+    if (localStorage.getItem('ayabot_dark') === '1') {
+      document.documentElement.classList.add('dark');
+    }
+  } catch (e) { /* 无痕模式忽略 */ }
+})();
+</script>
 <style>
-#app { background: #fff; min-height: 100vh; }
+#app { background: linear-gradient(160deg, #f8fafc 0%, #eef2ff 40%, #f0f9ff 100%); min-height: 100vh; }
 /* ── 礼物卡片（毛玻璃 + 主题色渐变）── */
 .bili-card {
     border-radius: 12px;
@@ -4390,6 +4507,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
     object-fit: contain;
     border-radius: 6px;
 }
+.gift-icon.mini {
+    width: 16px; height: 16px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
 .gift-value {
     background: rgba(255,255,255,0.2);
     border-radius: 8px;
@@ -4408,52 +4530,441 @@ INDEX_HTML = r"""<!DOCTYPE html>
     display: inline-block;
     vertical-align: middle;
 }
+
+/* ═══════ 精美导出卡片：日间浅色主题（跟随页面主题切换）═══════ */
+/* 默认 .bili-card 是深色设计；html 非 .dark 时切换为浅色玻璃风（截图克隆同样生效） */
+html:not(.dark) .bili-card {
+    color: #334155;
+    border: 1px solid rgba(148,163,184,0.22);
+    box-shadow: 0 3px 12px rgba(56,48,130,0.10), 0 1px 4px rgba(148,163,184,0.08);
+}
+html:not(.dark) .bili-card::after {
+    background: linear-gradient(180deg, rgba(255,255,255,0.55) 0%, transparent 100%);
+}
+/* 身份底色 → 日间浅色柔和渐变 */
+html:not(.dark) .bg-default { background: linear-gradient(135deg, #eef2f7 0%, #f8fafc 100%); }
+html:not(.dark) .bg-captain { background: linear-gradient(135deg, #dbeafe 0%, #eff6ff 100%); }
+html:not(.dark) .bg-commander { background: linear-gradient(135deg, #ede9fe 0%, #f5f3ff 100%); }
+html:not(.dark) .bg-governor { background: linear-gradient(135deg, #fef3c7 0%, #fefce8 100%); }
+/* 卡片内文字/边框工具类 → 日间深色 */
+html:not(.dark) .bili-card .text-white\/80 { color: rgba(51,65,85,0.82) !important; }
+html:not(.dark) .bili-card .text-white\/50 { color: rgba(51,65,85,0.5) !important; }
+html:not(.dark) .bili-card .border-white\/10 { border-color: rgba(148,163,184,0.25) !important; }
+/* 头像白边 → 浅灰边 */
+html:not(.dark) .avatar-wrap img.face { border: 2px solid rgba(255,255,255,0.95); box-shadow: 0 0 0 1px rgba(148,163,184,0.25); }
+/* gift-time 时间文字深色化 */
+html:not(.dark) .bili-card .gift-time,
+html:not(.dark) .gift-time { color: rgba(100,116,139,0.7) !important; }
+/* 礼物总额徽章金色在浅色卡上加深描边，保持可读 */
+html:not(.dark) .bili-card .gift-value { box-shadow: 0 1px 2px rgba(180,140,20,0.18); }
+
+/* ═────── 全局现代化覆盖（浅色极简玻璃拟态）─────── */
+#app input[class*="border"], #app textarea[class*="border"], #app select[class*="border"] {
+    border-radius: 0.75rem !important;
+    border-color: rgba(226,232,240,1) !important;
+    box-shadow: 0 1px 2px rgba(148,163,184,0.08) !important;
+    transition: border-color .15s ease, box-shadow .15s ease;
+    background-color: rgba(255,255,255,0.7) !important;
+}
+#app input[class*="border"]:focus, #app textarea[class*="border"]:focus, #app select[class*="border"]:focus {
+    border-color: #818cf8 !important;
+    box-shadow: 0 0 0 3px rgba(129,140,248,0.15) !important;
+    outline: none;
+}
+#app button[class*="bg-green"], #app button[class*="bg-blue"], #app button[class*="bg-red"],
+#app button[class*="bg-indigo"], #app button[class*="bg-gray"], #app button[class*="bg-slate"] {
+    border-radius: 0.75rem !important;
+    font-weight: 500;
+}
+#app div[class*="bg-white"][class*="rounded"], #app div[class*="border rounded-lg"] { border-radius: 1rem !important; }
+#app .bg-white.shadow { box-shadow: 0 4px 16px rgba(99,102,241,0.08) !important; }
+#app div[class*="fixed"][class*="bg-black"] { backdrop-filter: blur(6px); }
+#app .bg-white.rounded-xl.shadow-sm {
+    background-color: rgba(255,255,255,0.72) !important;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.9);
+    box-shadow: 0 8px 24px rgba(56,48,130,0.08), 0 2px 6px rgba(148,163,184,0.06) !important;
+}
+#app .bg-gray-50.rounded-lg {
+    background-color: rgba(248,250,252,0.7) !important;
+    backdrop-filter: blur(8px);
+    border-radius: 1rem !important;
+    border-color: rgba(226,232,240,0.8) !important;
+}
+#app button[class*="bg-blue-500"] { background-image: linear-gradient(to right, #6366f1, #0ea5e9) !important; background-color: transparent !important; }
+#app button[class*="bg-green-500"] { background-image: linear-gradient(to right, #10b981, #14b8a6) !important; background-color: transparent !important; box-shadow: 0 4px 12px rgba(16,185,129,0.25) !important; }
+#app button[class*="bg-gray-200"] { background-color: rgba(226,232,240,0.8) !important; }
+#app h2, #app h3 { letter-spacing: -0.01em; }
+
+/* 房间子页面精致化 */
+.gb-tabs { background: rgba(255,255,255,0.5); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.9); }
+.gb-tab { transition: all .18s ease; font-weight: 500; }
+.gb-tab:not(.active):hover { background: rgba(226,232,240,0.5); color: #4338ca; }
+.gb-tab.active { background-image: linear-gradient(120deg, #6366f1, #0ea5e9); color: #fff !important; box-shadow: 0 4px 12px rgba(99,102,241,0.35); }
+.gb-table { border-collapse: separate; border-spacing: 0; }
+.gb-table thead th { background: rgba(238,242,255,0.85) !important; backdrop-filter: blur(6px); font-weight: 600; color: #475569; letter-spacing: 0.01em; position: sticky; top: 0; z-index: 5; }
+.gb-table thead th:first-child { border-top-left-radius: 0.75rem; }
+.gb-table thead th:last-child { border-top-right-radius: 0.75rem; }
+.gb-table tbody tr { transition: background-color .15s ease; }
+.gb-table tbody tr:nth-child(even) { background: rgba(248,250,252,0.5); }
+.gb-table tbody tr:hover { background: rgba(238,242,255,0.7); }
+.gb-table tbody tr:last-child td:first-child { border-bottom-left-radius: 0.75rem; }
+.gb-table tbody tr:last-child td:last-child { border-bottom-right-radius: 0.75rem; }
+.rank-medal { display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 9999px; font-weight: 700; font-size: 0.75rem; color: #fff; }
+.rank-1 { background: linear-gradient(135deg, #f6b73c, #e8a020); box-shadow: 0 2px 6px rgba(245,158,11,0.4); }
+.rank-2 { background: linear-gradient(135deg, #cbd5e1, #94a3b8); box-shadow: 0 2px 6px rgba(148,163,184,0.4); }
+.rank-3 { background: linear-gradient(135deg, #f0a18a, #d97a4f); box-shadow: 0 2px 6px rgba(217,122,79,0.4); }
+.rank-plain { display: inline-flex; align-items: center; justify-content: center; min-width: 1.5rem; padding: 0 0.25rem; height: 1.5rem; border-radius: 9999px; background: rgba(226,232,240,0.6); color: #64748b; font-weight: 600; font-size: 0.75rem; }
+.gb-card-title { position: relative; padding-left: 0.85rem; }
+.gb-card-title::before { content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%); width: 4px; height: 1.1em; border-radius: 2px; background-image: linear-gradient(180deg, #6366f1, #0ea5e9); }
+
+/* 房间列表卡片（现代玻璃卡片） */
+.room-card {
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,0.9);
+    box-shadow: 0 2px 8px rgba(148,163,184,0.08);
+    border-radius: 1.25rem !important;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+.room-card.running { background: linear-gradient(135deg, rgba(240,253,244,0.8), rgba(236,254,255,0.6)); border-color: rgba(134,239,172,0.6); }
+.room-card.stopped { background: rgba(255,255,255,0.6); }
+.room-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 28px rgba(56,48,130,0.12), 0 4px 10px rgba(148,163,184,0.10);
+    border-color: rgba(129,140,248,0.5);
+}
+.room-card .status-dot { box-shadow: 0 0 0 3px rgba(34,197,94,0.18); }
+.room-card .room-name { letter-spacing: -0.01em; }
+.room-card .status-badge {
+    display: inline-flex; align-items: center;
+    padding: 2px 10px; border-radius: 9999px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.01em;
+}
+.room-card .status-badge.on { background: rgba(220,252,231,0.9); color: #15803d; }
+.room-card .status-badge.off { background: rgba(241,245,249,0.9); color: #64748b; }
+.btn-soft { transition: all .16s ease; backdrop-filter: blur(6px); }
+.btn-soft:hover { transform: translateY(-1px); box-shadow: 0 4px 10px rgba(148,163,184,0.18); }
+
+/* 新建房间表单（玻璃卡片） */
+.create-form {
+    background: linear-gradient(135deg, rgba(248,250,252,0.75), rgba(255,255,255,0.5));
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(226,232,240,0.9);
+    border-radius: 1.25rem !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+html.dark .create-form {
+    background: linear-gradient(135deg, rgba(30,41,59,0.6), rgba(15,23,42,0.5));
+    border-color: rgba(71,85,105,0.3);
+}
+html.dark .create-form input, html.dark .create-form select {
+    background-color: rgba(15,23,42,0.6) !important;
+    border-color: rgba(71,85,105,0.5) !important;
+    color: #e2e8f0 !important;
+}
+
+/* 主页面标题（柔和渐变衬底，不挤压 emoji） */
+.page-title { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.85rem; border-radius: 0.75rem; background: linear-gradient(120deg, rgba(99,102,241,0.10), rgba(14,165,233,0.06)); border: 1px solid rgba(129,140,248,0.18); font-weight: 700; letter-spacing: -0.01em; color: #334155; }
+html.dark .page-title { color: #e2e8f0; background: linear-gradient(120deg, rgba(99,102,241,0.22), rgba(14,165,233,0.10)); border-color: rgba(129,140,248,0.25); }
+
+/* 夜间模式房间卡片 */
+html.dark .room-card.running { background: linear-gradient(135deg, rgba(20,83,45,0.4), rgba(8,51,68,0.4)); border-color: rgba(74,222,128,0.25); }
+html.dark .room-card.stopped { background: rgba(30,41,59,0.5); }
+html.dark .room-card .room-name { color: #e2e8f0; }
+html.dark .room-card .status-badge.on { background: rgba(22,101,52,0.5); color: #86efac; }
+html.dark .room-card .status-badge.off { background: rgba(51,65,85,0.6); color: #94a3b8; }
+html.dark .btn-soft { background-color: rgba(30,41,59,0.6) !important; border-color: rgba(71,85,105,0.3); }
+html.dark .btn-soft.bg-green-50 { background-color: rgba(22,101,52,0.35) !important; color: #86efac; }
+html.dark .btn-soft.bg-yellow-50 { background-color: rgba(113,63,18,0.35) !important; color: #fcd34d; }
+html.dark .btn-soft.bg-red-50 { background-color: rgba(136,19,55,0.3) !important; color: #fca5a5; }
+
+/* 夜间模式（.dark 触发） */
+html.dark body { background-color: #0b1120; }
+html.dark #app { background: linear-gradient(160deg, #0b1120 0%, #0f1b33 45%, #0a1428 100%); }
+html.dark .from-slate-50 { --tw-gradient-from: #0f172a; --tw-gradient-to: #1e293b; }
+html.dark .via-white { --tw-gradient-stops: var(--tw-gradient-from), #111c2e, var(--tw-gradient-to); }
+html.dark .to-indigo-50\/70 { --tw-gradient-to: rgba(49,46,129,0.5); }
+html.dark .bg-slate-50 { background-color: #0f172a; }
+html.dark .text-slate-800 { color: #e2e8f0; }
+html.dark .text-slate-500, html.dark .text-slate-400, html.dark .text-gray-500,
+html.dark .text-gray-400, html.dark .text-gray-600, html.dark .text-gray-300 { color: #94a3b8; }
+html.dark .text-gray-700, html.dark .text-gray-800 { color: #e2e8f0; }
+html.dark .bg-indigo-200\/40 { background-color: rgba(67,56,202,0.25); }
+html.dark .bg-sky-200\/40 { background-color: rgba(14,116,144,0.25); }
+html.dark .bg-white\/70, html.dark .bg-white\/60, html.dark .bg-white {
+    background-color: rgba(30,41,59,0.55) !important;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+}
+html.dark .bg-white.rounded-xl.shadow-sm { background-color: rgba(30,41,59,0.55) !important; border-color: rgba(100,116,139,0.25); box-shadow: 0 8px 24px rgba(0,0,0,0.35) !important; }
+html.dark .bg-gray-50.rounded-lg { background-color: rgba(30,41,59,0.6) !important; border-color: rgba(100,116,139,0.2) !important; }
+html.dark .bg-gray-50 { background-color: rgba(30,41,59,0.7) !important; }
+html.dark header { background-color: rgba(15,23,42,0.7) !important; border-color: rgba(71,85,105,0.3) !important; box-shadow: 0 4px 20px rgba(0,0,0,0.4) !important; }
+html.dark input[class*="border"], html.dark textarea[class*="border"], html.dark select[class*="border"] {
+    background-color: rgba(15,23,42,0.6) !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important;
+}
+html.dark input::placeholder, html.dark textarea::placeholder { color: #64748b !important; }
+html.dark .gb-table thead th { background-color: rgba(30,41,59,0.9) !important; color: #cbd5e1 !important; }
+html.dark .gb-table tbody tr:nth-child(even) { background: rgba(30,41,59,0.35); }
+html.dark .gb-table tbody tr:hover { background: rgba(67,56,202,0.18) !important; }
+html.dark .border-t { border-color: rgba(71,85,105,0.2) !important; }
+html.dark .gb-tabs { background: rgba(30,41,59,0.6); border-color: rgba(71,85,105,0.3); }
+html.dark .gb-tab:not(.active) { color: #94a3b8; }
+html.dark .gb-tab:not(.active):hover { background: rgba(71,85,105,0.3); color: #e0e7ff; }
+html.dark div[class*="fixed"][class*="bg-black"] { background-color: rgba(0,0,0,0.6); }
+html.dark #app div[class*="bg-white"][class*="rounded"] { background-color: #1e293b !important; color: #e2e8f0; }
+html.dark .bg-gray-900 { background-color: #0b1220 !important; border: 1px solid #1e293b; }
+html.dark button[class*="bg-red-50"], html.dark button[class*="bg-amber-50"],
+html.dark div[class*="bg-red-50"], html.dark div[class*="bg-amber-50"], html.dark div[class*="bg-yellow-50"] {
+    background-color: rgba(30,41,59,0.6) !important; border-color: rgba(71,85,105,0.25) !important;
+}
+html.dark .text-red-500 { color: #f87171 !important; }
+html.dark .text-red-600 { color: #fca5a5 !important; }
+html.dark .text-amber-700, html.dark .text-yellow-700 { color: #fbbf24 !important; }
+html.dark .text-green-600 { color: #4ade80 !important; }
+
+/* ═────── 弹窗精致化（玻璃拟态卡片，共享覆盖全部 12 处弹窗）────── */
+.bg-white.rounded-xl.shadow-lg {
+    border-radius: 1.25rem !important;
+    border: 1px solid rgba(255,255,255,0.9) !important;
+    background-color: rgba(255,255,255,0.82) !important;
+    backdrop-filter: blur(20px) saturate(140%);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    box-shadow: 0 20px 50px rgba(56,48,130,0.18), 0 4px 16px rgba(148,163,184,0.10) !important;
+    animation: modalPop .18s ease-out;
+}
+@keyframes modalPop {
+    from { opacity: 0; transform: translateY(8px) scale(.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* 弹窗顶/底分隔线柔和 */
+.bg-white.rounded-xl.shadow-lg .border-b { border-color: rgba(148,163,184,0.18) !important; }
+.bg-white.rounded-xl.shadow-lg .border-t { border-color: rgba(148,163,184,0.18) !important; }
+/* 弹窗内条目块（bg-gray-50）统一浅玻璃 */
+.bg-white.rounded-xl.shadow-lg .bg-gray-50 { background-color: rgba(248,250,252,0.65) !important; border-radius: 0.85rem !important; border-color: rgba(226,232,240,0.7) !important; }
+/* 弹窗滚动条美化 */
+.bg-white.rounded-xl.shadow-lg ::-webkit-scrollbar { width: 8px; height: 8px; }
+.bg-white.rounded-xl.shadow-lg ::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.35); border-radius: 9999px; }
+.bg-white.rounded-xl.shadow-lg ::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,0.5); }
+.bg-white.rounded-xl.shadow-lg ::-webkit-scrollbar-track { background: transparent; }
+/* 弹窗内按钮统一圆角 */
+.bg-white.rounded-xl.shadow-lg button { border-radius: 0.6rem !important; }
+/* 弹窗标题区字间距 */
+.bg-white.rounded-xl.shadow-lg h3 { letter-spacing: -0.01em; }
+/* 夜间模式弹窗玻璃 */
+html.dark .bg-white.rounded-xl.shadow-lg {
+    background-color: rgba(17,24,39,0.85) !important;
+    border-color: rgba(71,85,105,0.35) !important;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.55) !important;
+}
+html.dark .bg-white.rounded-xl.shadow-lg .bg-gray-50 { background-color: rgba(30,41,59,0.5) !important; border-color: rgba(71,85,105,0.25) !important; }
+html.dark .bg-white.rounded-xl.shadow-lg input[class*="border"], html.dark .bg-white.rounded-xl.shadow-lg select[class*="border"], html.dark .bg-white.rounded-xl.shadow-lg textarea[class*="border"] {
+    background-color: rgba(15,23,42,0.6) !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important;
+}
+/* ── 弹幕记录工具区分组卡片（dm-toolbar）夜间适配 ── */
+html.dark .dm-toolbar { background-color: rgba(30,41,59,0.6) !important; border-color: rgba(71,85,105,0.3) !important; }
+html.dark .dm-toolbar .divide-y > * + * { border-color: rgba(71,85,105,0.25) !important; }
+/* ── 帮助页（使用指南）夜间适配 ── */
+html.dark .help-page { background-color: rgba(30,41,59,0.55) !important; border-color: rgba(100,116,139,0.25); box-shadow: 0 8px 24px rgba(0,0,0,0.35) !important; }
+html.dark .help-page .from-pink-50, html.dark .help-page .from-sky-50 { background-image: linear-gradient(120deg, rgba(244,114,182,0.12), rgba(56,189,248,0.10)) !important; border-color: rgba(244,114,182,0.3) !important; }
+html.dark .help-page .text-gray-800 { color: #e2e8f0 !important; }
+html.dark .help-page .text-gray-500 { color: #94a3b8 !important; }
+html.dark .help-page .text-gray-600 { color: #cbd5e1 !important; }
+html.dark .help-page .text-gray-400 { color: #94a3b8 !important; }
+html.dark .help-page .bg-blue-50 { background-color: rgba(59,130,246,0.15) !important; border-color: rgba(59,130,246,0.3) !important; }
+html.dark .help-page .text-blue-700 { color: #93c5fd !important; }
+html.dark .help-page .text-blue-600, html.dark .help-page .text-blue-500 { color: #93c5fd !important; }
+html.dark .help-page code.bg-indigo-50 { background-color: rgba(99,102,241,0.22) !important; color: #c7d2fe !important; }
+html.dark .help-page .border-slate-100 { border-color: rgba(71,85,105,0.25) !important; }
+html.dark .help-page .text-slate-700 { color: #e2e8f0 !important; }
+html.dark .help-page .hover\:bg-blue-100:hover { background-color: rgba(59,130,246,0.22) !important; }
+html.dark .dm-toolbar-row { border-color: rgba(71,85,105,0.25) !important; }
+html.dark .dm-toolbar .dm-toolbar-label { color: #94a3b8 !important; }
+html.dark .dm-toolbar .text-xs.text-gray-400 { color: #94a3b8 !important; }
+html.dark .dm-toolbar div[class*="border-l"] { border-color: rgba(71,85,105,0.3) !important; }
+html.dark .dm-toolbar label { color: #cbd5e1 !important; }
+/* 工具区通用控件（按钮/输入/下拉）夜间配色 */
+html.dark .dm-toolbar input[class*="border"], html.dark .dm-toolbar select[class*="border"], html.dark .dm-toolbar button[class*="border"] {
+    background-color: rgba(15,23,42,0.7) !important; border-color: rgba(71,85,105,0.45) !important; color: #e2e8f0 !important;
+}
+html.dark .dm-toolbar button[class*="border"]:hover { background-color: rgba(51,65,85,0.6) !important; }
+html.dark .dm-toolbar input::placeholder { color: #64748b !important; }
+/* 下拉框文字与背景强对比（日间/夜间），修复“颜色和字体几乎一样看不清” */
+.dm-toolbar select[class*="border"] { color: #1e293b !important; background-color: #ffffff !important; }
+.dm-toolbar select[class*="border"] option { color: #1e293b; background-color: #ffffff; }
+html.dark .dm-toolbar select[class*="border"] { color: #f1f5f9 !important; background-color: #1e293b !important; }
+html.dark .dm-toolbar select[class*="border"] option { color: #f1f5f9; background-color: #1e293b; }
+/* ── 弹幕记录整体美化（日间玻璃拟态） ── */
+/* 工具区分组标签：渐变胶囊 + 柔光 */
+.dm-toolbar-label {
+    display: inline-flex; align-items: center; justify-content: center;
+    height: 1.6rem; width: 3.4rem; flex: 0 0 3.4rem;
+    border-radius: 0.55rem; font-weight: 600; color: #ffffff !important;
+    font-size: 0.75rem; letter-spacing: 0.02em;
+    background-image: linear-gradient(135deg, #6366f1, #8b5cf6);
+    box-shadow: 0 2px 8px rgba(99,102,241,0.28);
+    margin: 0.25rem 0; line-height: 1.6rem;
+}
+/* 工具区行间距与包裹负边距对齐 */
+.dm-toolbar-row { align-items: center !important; }
+/* 工具区容器精致玻璃 */
+.dm-toolbar {
+    background: linear-gradient(180deg, rgba(255,255,255,0.75), rgba(248,250,252,0.55)) !important;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(226,232,240,0.9) !important;
+    box-shadow: 0 4px 16px rgba(148,163,184,0.08);
+    position: relative; z-index: 20; isolation: isolate;
+}
+/* 弹幕表格容器玻璃卡片 */
+.dm-table-wrap { border-radius: 0.9rem; border: 1px solid rgba(226,232,240,0.9); overflow: hidden; background: rgba(255,255,255,0.6); }
+.dm-table-wrap .gb-table tbody tr { box-shadow: inset 0 -1px 0 rgba(226,232,240,0.5); }
+/* 录像/场次徽章 */
+.dm-sess-badge {
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 2px 8px; border-radius: 9999px; font-weight: 700; font-size: 10px;
+    background: linear-gradient(135deg, #ede9fe, #e0f2fe); color: #7c3aed;
+    border: 1px solid rgba(216,180,254,0.5);
+}
+.dm-rel-time { color: #7c3aed; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* 弹幕统计面板 */
+.dm-stats-card {
+    border-radius: 0.75rem; border: 1px solid rgba(226,232,240,0.5);
+    background: rgba(255,255,255,0.6);
+}
+/* 分页胶囊按钮 */
+.dm-page-btn {
+    border-radius: 9999px !important; padding: 4px 14px !important;
+    transition: all .15s ease;
+}
+/* 夜间：弹幕记录美化覆盖 */
+html.dark .dm-toolbar {
+    background: linear-gradient(180deg, rgba(30,41,59,0.68), rgba(15,23,42,0.55)) !important;
+    border-color: rgba(71,85,105,0.35) !important;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+}
+html.dark .dm-toolbar-label {
+    background-image: linear-gradient(135deg, #6366f1, #7c3aed);
+    box-shadow: 0 2px 10px rgba(99,102,241,0.4);
+}
+html.dark .dm-table-wrap { background: rgba(15,23,42,0.45); border-color: rgba(71,85,105,0.3); }
+html.dark .dm-table-wrap .gb-table tbody tr { box-shadow: inset 0 -1px 0 rgba(71,85,105,0.2); }
+html.dark .dm-stats-card { background: rgba(15,23,42,0.5); border-color: rgba(71,85,105,0.3); }
+html.dark .dm-stats-card .bg-gray-100 { background-color: rgba(30,41,59,0.8) !important; }
+/* ── 可搜索场次选择器面板 ── */
+.dm-sess-picker .dm-sess-trigger { min-width: 11rem; text-align: left; }
+.dm-sess-picker .dm-sess-trigger .text-gray-800 { color: #1e293b; }
+html.dark .dm-sess-picker .dm-sess-trigger { color: #f1f5f9 !important; background-color: #1e293b !important; border-color: rgba(71,85,105,0.45) !important; }
+html.dark .dm-sess-picker .dm-sess-trigger .text-gray-400 { color: #94a3b8 !important; }
+html.dark .dm-sess-picker .dm-sess-trigger .text-gray-800 { color: #f1f5f9 !important; }
+.dm-sess-picker .absolute { z-index: 60; }
+html.dark .dm-sess-picker .absolute { background-color: #1e293b !important; border-color: rgba(71,85,105,0.35) !important; }
+html.dark .dm-sess-picker .absolute .border-gray-100 { border-color: rgba(71,85,105,0.25) !important; }
+html.dark .dm-sess-picker .absolute .border-b,
+html.dark .dm-sess-picker .absolute .border-t { border-color: rgba(71,85,105,0.25) !important; }
+html.dark .dm-sess-picker .absolute .bg-white { background-color: #1e293b !important; }
+html.dark .dm-sess-picker .absolute input[class*="border"] { background-color: #0f172a !important; border-color: rgba(71,85,105,0.5) !important; color: #e2e8f0 !important; }
+html.dark .dm-sess-picker .absolute input::placeholder { color: #64748b !important; }
+html.dark .dm-sess-picker .absolute .hover\:bg-blue-50:hover { background-color: rgba(99,102,241,0.18) !important; }
+html.dark .dm-sess-picker .absolute .text-gray-700 { color: #e2e8f0 !important; }
+html.dark .dm-sess-picker .absolute .bg-blue-50 { background-color: rgba(99,102,241,0.22) !important; }
+html.dark .dm-sess-picker .absolute .text-blue-700 { color: #a5b4fc !important; }
+html.dark .dm-sess-picker .absolute .max-h-64::-webkit-scrollbar-thumb { background: rgba(71,85,105,0.4); }
+/* 追加 end */
+html.dark .dm-sess-badge { background: rgba(124,58,237,0.25); color: #c4b5fd; border-color: rgba(167,139,250,0.4); }
+html.dark .dm-rel-time { color: #c4b5fd; }
+/* 弹窗遮罩统一毛玻璃 */
+div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+
+/* ── 全局细滚动条（统一柔和） ── */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.3); border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(99,102,241,0.5); }
+::-webkit-scrollbar-track { background: transparent; }
 </style>
 </head>
 <body class="bg-gray-100 p-2 sm:p-4">
 <div id="app" class="max-w-6xl mx-auto" style="min-height:80vh;"><!-- 初始白屏防止闪烁 -->
 
 <!-- ══════ 登录页 ══════ -->
-<div v-if="!loggedIn" class="flex items-center justify-center min-h-[80vh] px-4">
-    <div class="bg-white p-6 sm:p-8 rounded-xl shadow-md w-full max-w-sm">
-        <h1 class="text-xl font-bold text-center text-blue-600 mb-6 flex items-center justify-center gap-2"><img src="/icon-192.png" alt="" class="w-7 h-7 rounded-lg">Ayabot 管理后台</h1>
-        <div class="space-y-4">
-            <input v-model="loginUser" placeholder="账号" class="border p-2 rounded w-full text-sm" @keyup.enter="doLogin">
-            <input v-model="loginPass" type="password" placeholder="密码" class="border p-2 rounded w-full text-sm" @keyup.enter="doLogin">
-            <div v-if="loginErr" class="text-red-500 text-sm">{{ loginErr }}</div>
-            <button @click="doLogin" class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded w-full">登录</button>
-            <div class="mt-3 text-xs text-center text-amber-700 bg-amber-50 rounded p-2 border border-amber-200 leading-relaxed">
-                初始账号: <strong>ayabot</strong>&nbsp;&nbsp;密码: <strong>123456</strong><br>
-                <span class="text-gray-500">（首次登录请修改密码）</span>
+<div v-if="!loggedIn" class="min-h-screen flex items-center justify-center px-4 py-10 bg-gradient-to-br from-slate-50 via-white to-indigo-50/70 relative overflow-hidden">
+    <!-- 夜间模式切换（登录页右上角） -->
+    <button @click="toggleTheme"
+            class="absolute top-4 right-4 z-20 flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-medium transition backdrop-blur border"
+            :class="isDark ? 'bg-slate-800/80 text-amber-300 border-slate-700 hover:bg-slate-700' : 'bg-white/70 text-slate-600 border-slate-200 hover:bg-slate-100'"
+            :title="isDark ? '切换到日间模式' : '切换到夜间模式'">
+        <span class="text-base leading-none">{{ isDark ? '🌙' : '☀️' }}</span>
+        <span class="hidden sm:inline">{{ isDark ? '夜间' : '日间' }}</span>
+    </button>
+    <!-- 背景装饰光斑 -->
+    <div class="pointer-events-none absolute -top-24 -left-24 w-96 h-96 rounded-full bg-indigo-200/40 blur-3xl"></div>
+    <div class="pointer-events-none absolute -bottom-32 -right-16 w-[28rem] h-[28rem] rounded-full bg-sky-200/40 blur-3xl"></div>
+    <div v-if="false" class="pointer-events-none absolute top-1/3 right-1/4 w-40 h-40 rounded-full bg-violet-200/30 blur-2xl"></div>
+
+    <div class="relative w-full max-w-md">
+        <div class="bg-white/70 backdrop-blur-xl p-8 sm:p-10 rounded-3xl shadow-2xl shadow-indigo-100/60 border border-white/60 ring-1 ring-slate-900/5">
+            <div class="flex items-center justify-center gap-3 mb-8">
+                <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-indigo-500 to-sky-400 flex items-center justify-center shadow-lg shadow-indigo-200/60">
+                    <img src="/icon-192.png" alt="" class="w-8 h-8 rounded-lg">
+                </div>
+                <div>
+                    <h1 class="text-2xl font-bold text-slate-800 tracking-tight">Ayabot 管理后台</h1>
+                    <p class="text-xs text-slate-400 mt-0.5">Bilibili 直播间机器人控制台</p>
+                </div>
             </div>
-        </div>
-        <div class="mt-5 pt-4 border-t border-gray-100 text-center">
-            <p class="text-xs text-gray-400">
-                <a href="https://github.com/yujianke100/ayabot" target="_blank" class="text-blue-500 hover:underline">⭐ GitHub</a>
-                <span class="mx-1">·</span>
-                <span class="text-red-500 font-bold">完全免费</span> · 开源
-                <span class="block mt-1">Ayabot __AYABOT_VERSION__</span>
-            </p>
+            <div class="space-y-4">
+                <div>
+                    <label class="text-xs text-slate-500 font-medium mb-1.5 block">账号</label>
+                    <input v-model="loginUser" placeholder="请输入账号" class="w-full px-4 py-3 rounded-xl bg-white/70 border border-slate-200 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition text-sm placeholder:text-slate-300 shadow-sm" @keyup.enter="doLogin">
+                </div>
+                <div>
+                    <label class="text-xs text-slate-500 font-medium mb-1.5 block">密码</label>
+                    <input v-model="loginPass" type="password" placeholder="请输入密码" class="w-full px-4 py-3 rounded-xl bg-white/70 border border-slate-200 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition text-sm placeholder:text-slate-300 shadow-sm" @keyup.enter="doLogin">
+                </div>
+                <div v-if="loginErr" class="text-red-500 text-sm bg-red-50 rounded-xl px-4 py-2.5 border border-red-100">{{ loginErr }}</div>
+                <button @click="doLogin" class="w-full py-3 rounded-xl bg-gradient-to-r from-indigo-500 to-sky-500 hover:from-indigo-600 hover:to-sky-600 text-white font-semibold shadow-lg shadow-indigo-200/60 transition hover:shadow-indigo-300/60 active:scale-[0.99]">登 录</button>
+                <div class="text-xs text-center text-amber-700 bg-amber-50 rounded-xl p-3 border border-amber-100 leading-relaxed">
+                    初始账号: <strong>ayabot</strong> · 密码: <strong>123456</strong><br>
+                    <span class="text-slate-400">（首次登录请修改密码）</span>
+                </div>
+            </div>
+            <div class="mt-6 pt-5 border-t border-slate-100 text-center">
+                <p class="text-xs text-slate-400">
+                    <a href="https://github.com/yujianke100/ayabot" target="_blank" class="text-indigo-500 hover:underline">⭐ GitHub</a>
+                    <span class="mx-1">·</span>
+                    <span class="text-rose-500 font-bold">完全免费</span> · 开源
+                    <span class="block mt-1">Ayabot __AYABOT_VERSION__</span>
+                </p>
+            </div>
         </div>
     </div>
 </div>
 
 <!-- ══════ 主界面 ══════ -->
 <div v-if="loggedIn">
-<header class="mb-4 sm:mb-6 flex flex-wrap items-center bg-white p-3 sm:p-4 rounded-xl shadow-sm gap-2">
-    <h1 class="text-base sm:text-xl font-bold text-blue-600 flex-shrink-0 flex items-center gap-1.5"><img src="/icon-192.png" alt="Ayabot" class="w-5 h-5 sm:w-6 sm:h-6 rounded-md flex-shrink-0">Ayabot</h1>
+<header class="sticky top-3 z-40 mb-5 rounded-2xl bg-white/70 backdrop-blur-xl border border-white/70 shadow-lg shadow-indigo-100/40 px-3 sm:px-5 py-3 flex flex-wrap items-center gap-2">
+    <h1 class="text-base sm:text-lg font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-sky-500 flex-shrink-0 flex items-center gap-2"><img src="/icon-192.png" alt="Ayabot" class="w-6 h-6 rounded-lg shadow-sm flex-shrink-0">Ayabot</h1>
     <div class="flex-1 min-w-0"></div>
-    <div class="flex items-center gap-2 text-xs sm:text-sm sm:order-none order-last w-full sm:w-auto mt-1.5 sm:mt-0
-                pt-1.5 sm:pt-0 border-t border-gray-100 sm:border-0 sm:justify-end mr-0 sm:mr-2">
-        <button @click="tab='rooms'" :class="tab==='rooms'?'text-blue-600 font-bold border-b-2 border-blue-600':''" class="whitespace-nowrap px-1.5 py-1.5 sm:px-0 sm:py-0">🏠 房间管理</button>
-        <button v-if="userRole === 'admin'" @click="tab='global'" :class="tab==='global'?'text-blue-600 font-bold border-b-2 border-blue-600':''" class="whitespace-nowrap px-1.5 py-1.5 sm:px-0 sm:py-0">⚙️ 全局配置</button>
-        <button v-if="userRole === 'admin'" @click="tab='users'" :class="tab==='users'?'text-blue-600 font-bold border-b-2 border-blue-600':''" class="whitespace-nowrap px-1.5 py-1.5 sm:px-0 sm:py-0">👥 用户管理</button>
-        <button @click="tab='help'"  :class="tab==='help' ?'text-blue-600 font-bold border-b-2 border-blue-600':''" class="whitespace-nowrap px-1.5 py-1.5 sm:px-0 sm:py-0">帮助</button>
+    <div class="flex items-center gap-1 bg-white/60 rounded-xl p-1 border border-slate-100 shadow-sm text-xs sm:text-sm sm:order-none order-last w-full sm:w-auto mt-1.5 sm:mt-0">
+        <button @click="tab='rooms'" :class="tab==='rooms'?'bg-gradient-to-r from-indigo-500 to-sky-500 text-white shadow':''" class="whitespace-nowrap px-3 py-1.5 rounded-lg transition">🏠 房间管理</button>
+        <button v-if="userRole === 'admin'" @click="tab='global'" :class="tab==='global'?'bg-gradient-to-r from-indigo-500 to-sky-500 text-white shadow':''" class="whitespace-nowrap px-3 py-1.5 rounded-lg transition">⚙️ 全局配置</button>
+        <button v-if="userRole === 'admin'" @click="tab='users'" :class="tab==='users'?'bg-gradient-to-r from-indigo-500 to-sky-500 text-white shadow':''" class="whitespace-nowrap px-3 py-1.5 rounded-lg transition">👥 用户管理</button>
+        <button @click="tab='help'"  :class="tab==='help' ?'bg-gradient-to-r from-indigo-500 to-sky-500 text-white shadow':''" class="whitespace-nowrap px-3 py-1.5 rounded-lg transition">帮助</button>
     </div>
+    <!-- 夜间模式切换 -->
+    <button @click="toggleTheme"
+            class="flex-shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium transition border border-slate-200/60"
+            :class="isDark ? 'bg-slate-700 text-amber-300 hover:bg-slate-600' : 'bg-white/70 text-slate-600 hover:bg-slate-100'"
+            :title="isDark ? '切换到日间模式' : '切换到夜间模式'">
+        <span class="text-sm leading-none">{{ isDark ? '🌙' : '☀️' }}</span>
+        <span class="hidden sm:inline">{{ isDark ? '夜间' : '日间' }}</span>
+    </button>
     <!-- 新版本提醒（启动静默检查到更新，管理员可见） -->
     <button v-if="updateNotice && userRole === 'admin'" @click="openUpdateNotice()"
-            class="flex-shrink-0 flex items-center gap-1 bg-amber-50 hover:bg-amber-100 border border-amber-200
-                   text-amber-700 px-2 py-1 rounded-lg text-xs whitespace-nowrap mr-1"
+            class="flex-shrink-0 flex items-center gap-1 bg-amber-50/80 hover:bg-amber-100 border border-amber-200
+                   text-amber-700 px-2.5 py-1.5 rounded-xl text-xs whitespace-nowrap mr-1 backdrop-blur"
             :title="'发现新版本 ' + updateNotice + '，点击查看'">
         <span class="relative flex h-2 w-2">
             <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
@@ -4463,21 +4974,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span class="sm:hidden">🎁</span>
     </button>
     <div class="relative flex-shrink-0">
-        <button @click="showUserMenu = !showUserMenu" class="text-gray-600 hover:text-gray-800 border rounded px-2 py-1 text-xs whitespace-nowrap">
-            {{ loginUser }} ▾
+        <button @click="showUserMenu = !showUserMenu" class="text-slate-600 hover:text-slate-900 border border-slate-100 bg-white/70 rounded-xl px-3 py-1.5 text-xs whitespace-nowrap shadow-sm transition hover:shadow">
+            👤 {{ loginUser }} ▾
         </button>
-        <div v-if="showUserMenu" class="absolute right-0 top-full mt-1 bg-white border rounded-xl shadow-lg w-44 text-sm overflow-hidden z-[100]" @click.stop>
-            <div class="px-4 py-2.5 border-b text-xs text-gray-400 font-medium truncate">{{ loginUser }}</div>
-            <button @click="openChangePwd(); showUserMenu=false" class="block w-full text-left px-4 py-2.5 hover:bg-gray-50 border-b">🔑 修改密码</button>
-            <button @click="doLogout" class="block w-full text-left px-4 py-2.5 hover:bg-gray-50 text-red-500">退出登录</button>
+        <div v-if="showUserMenu" class="absolute right-0 top-full mt-2 bg-white/95 backdrop-blur border border-slate-100 rounded-2xl shadow-xl w-48 text-sm overflow-hidden z-[100] @click.stop" @click.stop>
+            <div class="px-4 py-3 border-b border-slate-50 text-xs text-slate-400 font-medium truncate">{{ loginUser }}</div>
+            <button @click="openChangePwd(); showUserMenu=false" class="block w-full text-left px-4 py-2.5 hover:bg-indigo-50/50 border-b border-slate-50 transition">🔑 修改密码</button>
+            <button @click="doLogout" class="block w-full text-left px-4 py-2.5 hover:bg-red-50/50 text-red-500 transition">退出登录</button>
         </div>
     </div>
 </header>
 
-<style>
-.no-scrollbar::-webkit-scrollbar { display: none; }
-.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-</style>
+<style></style>
 
 <!-- ══════ 修改密码弹窗 ══════ -->
 <div v-if="showChangePwd" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" :style="mustResetPwd ? 'backdrop-filter:blur(4px);' : ''" @mousedown.self="mustResetPwd || (showChangePwd = false)">
@@ -4507,53 +5015,53 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div v-if="!selectedRoom">
         <div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm space-y-4">
             <div class="flex items-center justify-between flex-wrap gap-2">
-                <h2 class="text-lg font-bold">🏠 房间管理</h2>
+                <h2 class="page-title">🏠 房间管理</h2>
                 <button v-show="userRole === 'admin'" @click="toggleCreateRoom"
-                        class="bg-green-500 hover:bg-green-600 text-white px-3 sm:px-4 py-2 rounded text-xs sm:text-sm">
+                        class="bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm shadow-md shadow-emerald-200/50 transition active:scale-[0.98]">
                     {{ showCreateRoom ? '取消' : '➕ 新建房间' }}
                 </button>
             </div>
 
             <!-- 新建表单 -->
-            <div v-if="showCreateRoom" class="border rounded-lg p-4 bg-gray-50 space-y-3">
-                <h3 class="text-sm font-bold">新建直播间</h3>
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <label class="text-xs text-gray-500">主播 UID
+            <div v-if="showCreateRoom" class="create-form rounded-2xl p-4 sm:p-5 space-y-3">
+                <h3 class="text-sm font-bold text-slate-700">➕ 新建直播间</h3>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <label class="text-xs text-gray-500 leading-relaxed">主播 UID
                         <input type="number" v-model.number="newRoomUid" placeholder="B站 主播 UID"
-                               class="border p-2 rounded w-full text-sm mt-1">
-                        <span v-if="newRoomAnchorName" class="text-[11px]" :class="newRoomAnchorName.startsWith('(') ? 'text-yellow-500' : 'text-green-600'">
+                               class="border p-2 rounded-xl w-full text-sm mt-1.5 bg-white/70 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition">
+                        <span v-if="newRoomAnchorName" class="text-[11px] mt-1 inline-block" :class="newRoomAnchorName.startsWith('(') ? 'text-yellow-500' : 'text-green-600'">
                             👤 {{ newRoomAnchorName }}
                         </span>
                     </label>
-                    <label class="text-xs text-gray-500">直播间名称
-                        <input type="text" v-model="newRoomName" placeholder="留空则使用主播用户名" class="border p-2 rounded w-full text-sm mt-1">
+                    <label class="text-xs text-gray-500 leading-relaxed">直播间名称
+                        <input type="text" v-model="newRoomName" placeholder="留空则使用主播用户名" class="border p-2 rounded-xl w-full text-sm mt-1.5 bg-white/70 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition">
                     </label>
-                    <label class="text-xs text-gray-500">直播间号
+                    <label class="text-xs text-gray-500 leading-relaxed">直播间号
                         <input type="number" v-model.number="newRoomDisplayId" placeholder="B站 直播间号，如 1946287911"
-                               class="border p-2 rounded w-full text-sm mt-1">
+                               class="border p-2 rounded-xl w-full text-sm mt-1.5 bg-white/70 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition">
                     </label>
-                    <label class="text-xs text-gray-500">关联 B站 账号
-                        <select v-model="newRoomAccount" class="border p-2 rounded w-full text-sm mt-1">
+                    <label class="text-xs text-gray-500 leading-relaxed">关联 B站 账号
+                        <select v-model="newRoomAccount" class="border p-2 rounded-xl w-full text-sm mt-1.5 bg-white/70 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition">
                             <option value="">暂不关联</option>
                             <option v-for="a in accounts" :key="a.uid" :value="a.uid">{{ a.nickname || 'UID:'+a.uid }}</option>
                         </select>
                     </label>
-                    <label class="text-xs text-gray-500">AI回复模板
-                        <select v-model="newRoomLlmTemplate" class="border p-2 rounded w-full text-sm mt-1">
+                    <label class="text-xs text-gray-500 leading-relaxed">AI回复模板
+                        <select v-model="newRoomLlmTemplate" class="border p-2 rounded-xl w-full text-sm mt-1.5 bg-white/70 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition">
                             <option value="">默认（无模板）</option>
                             <option v-for="t in llmTemplates" :key="t.name" :value="t.name">{{ t.name }}</option>
                         </select>
                     </label>
-                    <label class="text-xs text-gray-500">机器人配置模板
-                        <select v-model="newRoomBotTemplate" class="border p-2 rounded w-full text-sm mt-1">
+                    <label class="text-xs text-gray-500 leading-relaxed">机器人配置模板
+                        <select v-model="newRoomBotTemplate" class="border p-2 rounded-xl w-full text-sm mt-1.5 bg-white/70 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition">
                             <option value="">默认（无模板）</option>
                             <option v-for="t in botTemplates" :key="t.name" :value="t.name">{{ t.name }}</option>
                         </select>
                     </label>
                 </div>
-                <div class="flex gap-2">
+                <div class="flex gap-3 items-center pt-1">
                     <button @click="createRoom" :disabled="creatingRoom"
-                            class="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded text-sm">
+                            class="bg-gradient-to-r from-blue-500 to-sky-500 hover:from-blue-600 hover:to-sky-600 text-white px-5 py-2 rounded-xl text-sm shadow-md shadow-blue-200/60 transition active:scale-[0.98]">
                         {{ creatingRoom ? '创建中...' : '创建' }}
                     </button>
                     <div v-if="createRoomMsg" class="text-sm" :class="createRoomOk ? 'text-green-600' : 'text-red-500'">
@@ -4568,26 +5076,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 <template v-else>暂无可用房间。</template>
             </div>
             <div v-for="r in rooms" :key="r.room_id"
-                 class="border rounded-lg p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 cursor-pointer hover:shadow-md transition"
-                 :class="r.status==='running' ? 'border-green-300 bg-green-50' : 'border-gray-200'"
+                 class="room-card rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 cursor-pointer transition"
+                 :class="r.status==='running' ? 'running' : 'stopped'"
                  @click="selectRoom(r)">
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 flex-wrap">
-                        <span class="w-2 h-2 rounded-full inline-block shrink-0"
+                        <span class="w-2 h-2 rounded-full inline-block shrink-0 status-dot"
                               :class="r.status==='running' ? 'bg-green-500' : 'bg-gray-400'"></span>
-                        <span class="font-bold text-sm">{{ r.room_name || ('#'+r.room_id) }}</span>
+                        <span class="font-bold text-sm text-slate-700 room-name">{{ r.room_name || ('#'+r.room_id) }}</span>
                         <span v-if="r.room_name" class="text-xs text-gray-400">#{{ r.room_id }}</span>
                         <span class="text-xs text-gray-400 ml-1 break-all">UID: {{ r.anchor_uid }}</span>
                     </div>
-                    <div class="text-xs text-gray-500 mt-1 flex gap-3 flex-wrap items-center">
-                        <span>状态: {{ r.status === 'running' ? '🟢 运行中' : '⏹️ 已停止' }}</span>
+                    <div class="text-xs text-gray-500 mt-1.5 flex gap-2 flex-wrap items-center">
+                        <span class="status-badge" :class="r.status === 'running' ? 'on' : 'off'">{{ r.status === 'running' ? '🟢 运行中' : '⏹️ 已停止' }}</span>
                         <span v-if="r.account_nick">账号: {{ r.account_nick }}</span>
                         <span v-if="r.auth_status === 'needs_login'"
-                              class="px-2 py-0.5 rounded bg-red-100 text-red-600 font-medium">
+                              class="px-2.5 py-0.5 rounded-full bg-red-100 text-red-600 font-medium text-[11px]">
                             ⚠️ 登录已失效，需重新扫码
                         </span>
                         <span v-else-if="r.recent_crash"
-                              class="px-2 py-0.5 rounded bg-yellow-100 text-yellow-700">
+                              class="px-2.5 py-0.5 rounded-full bg-yellow-100 text-yellow-700 text-[11px]">
                             ⚠️ 刚发生异常退出（已自动恢复）
                         </span>
                     </div>
@@ -4596,15 +5104,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <button v-if="r.status !== 'running'"
                             @click="startRoom(r.room_id)"
                             :disabled="startingRooms.has(r.room_id)"
-                            class="bg-green-500 hover:bg-green-600 disabled:bg-green-300 text-white px-4 py-2 sm:py-1 rounded text-xs whitespace-nowrap"
-                            v-show="userRole === 'admin'">{{ startingRooms.has(r.room_id) ? '启动中...' : '启动' }}</button>
+                            class="btn-soft bg-green-50 hover:bg-green-100 text-green-700 disabled:bg-green-50 disabled:text-green-300 px-4 py-2 sm:py-1 rounded-lg text-xs whitespace-nowrap font-medium"
+                            v-show="userRole === 'admin'">{{ startingRooms.has(r.room_id) ? '启动中...' : '▶ 启动' }}</button>
                     <button v-if="r.status === 'running'"
                             @click="stopRoom(r.room_id)"
-                            class="bg-yellow-500 hover:bg-yellow-600 text-white px-4 py-2 sm:py-1 rounded text-xs whitespace-nowrap"
-                            v-show="userRole === 'admin'">停止</button>
+                            class="btn-soft bg-yellow-50 hover:bg-yellow-100 text-yellow-700 px-4 py-2 sm:py-1 rounded-lg text-xs whitespace-nowrap font-medium"
+                            v-show="userRole === 'admin'">⏹ 停止</button>
                     <button @click="deleteRoom(r.room_id, r.room_id)"
-                            class="bg-red-100 hover:bg-red-200 text-red-600 px-4 py-2 sm:py-1 rounded text-xs font-medium whitespace-nowrap"
-                            v-show="userRole === 'admin'">删除</button>
+                            class="btn-soft bg-red-50 hover:bg-red-100 text-red-500 px-4 py-2 sm:py-1 rounded-lg text-xs font-medium whitespace-nowrap"
+                            v-show="userRole === 'admin'">🗑 删除</button>
                 </div>
             </div>
         </div>
@@ -4675,11 +5183,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
         </div>
 
         <!-- 子导航：手机横向滚动，不折成竖排文字 -->
-        <div class="flex gap-1 mb-4 text-sm bg-white rounded-xl shadow-sm p-1 overflow-x-auto no-scrollbar">
+        <div class="flex gap-1 mb-4 text-sm bg-white rounded-xl shadow-sm p-1 overflow-x-auto no-scrollbar gb-tabs">
             <button v-for="st in roomSubTabs" :key="st.key"
                     @click="selectRoomSubTab(st.key)"
-                    class="px-3 sm:px-4 py-2 rounded-lg transition whitespace-nowrap shrink-0"
-                    :class="roomSubTab === st.key ? 'bg-blue-500 text-white' : 'text-gray-600 hover:bg-gray-100'">
+                    class="gb-tab px-3 sm:px-4 py-2 rounded-lg transition whitespace-nowrap shrink-0"
+                    :class="roomSubTab === st.key ? 'bg-blue-500 text-white active' : 'text-gray-600 hover:bg-gray-100'">
                 {{ st.label }}
             </button>
         </div>
@@ -4700,16 +5208,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 <div v-if="errRanking" class="text-red-500 text-sm mb-2">{{ errRanking }}</div>
                 <div class="overflow-y-auto max-h-[520px]" v-if="ranking.length">
                     <div class="overflow-x-auto">
-                    <table class="w-full text-xs sm:text-sm">
+                    <table class="w-full text-xs sm:text-sm gb-table">
                         <thead><tr class="bg-gray-50 sticky top-0"><th class="p-2 text-left">#</th><th class="p-2 text-left">用户</th><th class="p-2 text-right">价值</th><th class="p-2 text-right">利润</th></tr></thead>
                         <tbody>
                             <tr v-for="(u,i) in ranking" :key="u.uid"
                                 class="border-t hover:bg-blue-50 cursor-pointer transition"
                                 @click="gotoExport(u.uid, u.uname)">
-                                <td class="p-2">{{ i+1 }}</td>
-                                <td class="p-2">{{ u.uname }}</td>
-                                <td class="p-2 text-right">{{ Number(u.total_val).toFixed(1) }}</td>
-                                <td class="p-2 text-right" :class="Number(u.total_profit)>=0?'text-red-500':'text-green-500'">{{ Number(u.total_profit).toFixed(1) }}</td>
+                                <td class="p-2">
+                                    <span class="rank-plain" :class="{'rank-1': i===0, 'rank-2': i===1, 'rank-3': i===2}">{{ i+1 }}</span>
+                                </td>
+                                <td class="p-2 font-medium text-gray-700">{{ u.uname }}</td>
+                                <td class="p-2 text-right font-semibold text-gray-800">{{ Number(u.total_val).toFixed(1) }}</td>
+                                <td class="p-2 text-right font-semibold" :class="Number(u.total_profit)>=0?'text-red-500':'text-green-500'">{{ Number(u.total_profit).toFixed(1) }}</td>
                             </tr>
                         </tbody>
                     </table>
@@ -4724,7 +5234,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
             <!-- 大航海（上舰）记录 -->
             <div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm">
                 <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-                    <h3 class="font-bold text-sm">🚢 上舰记录
+                    <h3 class="font-bold text-sm gb-card-title">🚢 上舰记录
                         <span v-if="guardTotals" class="font-normal text-xs text-gray-400 ml-1">
                             共 {{ guardTotals.count }} 次 · 舰长 {{ guardTotals.captain }} / 提督 {{ guardTotals.commander }} / 总督 {{ guardTotals.governor }}
                             · 价值 {{ guardTotals.value }} 电池
@@ -4733,7 +5243,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <button @click="loadGuards" class="text-xs text-blue-500 hover:underline">刷新</button>
                 </div>
                 <div v-if="guardItems.length" class="overflow-y-auto max-h-[360px]">
-                    <table class="w-full text-xs sm:text-sm">
+                    <table class="w-full text-xs sm:text-sm gb-table">
                         <thead><tr class="bg-gray-50 sticky top-0">
                             <th class="p-2 text-left">时间</th><th class="p-2 text-left">用户</th>
                             <th class="p-2 text-left">等级</th><th class="p-2 text-right">月数</th>
@@ -4742,15 +5252,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         <tbody>
                             <tr v-for="g in guardItems" :key="g.uid + '-' + g.start_time" class="border-t">
                                 <td class="p-2 text-gray-500 whitespace-nowrap">{{ fmtGuardTime(g.ts) }}</td>
-                                <td class="p-2">{{ g.uname }}</td>
+                                <td class="p-2 font-medium text-gray-700">{{ g.uname }}</td>
                                 <td class="p-2">
-                                    <span class="px-1.5 py-0.5 rounded text-[10px] font-bold"
+                                    <span class="px-2 py-0.5 rounded-full text-[10px] font-bold shadow-sm"
                                           :class="g.guard_level === 1 ? 'bg-amber-100 text-amber-700'
                                                 : g.guard_level === 2 ? 'bg-purple-100 text-purple-700'
                                                 : 'bg-blue-100 text-blue-700'">{{ g.guard_name || '大航海' }}</span>
                                 </td>
                                 <td class="p-2 text-right">{{ g.months }}</td>
-                                <td class="p-2 text-right">{{ g.value }}</td>
+                                <td class="p-2 text-right font-semibold text-gray-800">{{ g.value }}</td>
                             </tr>
                         </tbody>
                     </table>
@@ -4845,6 +5355,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         <input type="checkbox" v-model="eMergeGifts" class="w-4 h-4">
                         <span>合并相同礼物</span>
                     </label>
+                    <label class="text-xs text-gray-500 flex items-center gap-1.5 h-[38px]">
+                        <input type="checkbox" v-model="eMergeUser" class="w-4 h-4">
+                        <span>按用户合并</span>
+                    </label>
+                    <label class="text-xs text-gray-500 flex items-center gap-1.5 h-[38px]">
+                        <input type="checkbox" v-model="eShowPrice" class="w-4 h-4">
+                        <span>显示金额</span>
+                    </label>
                     <label class="text-xs text-gray-500">每列行数
                         <input type="number" v-model.number="ePerCol" min="1" max="50" class="border p-2 rounded text-sm mt-0.5 w-20">
                     </label>
@@ -4888,13 +5406,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
                                     <span v-if="item.guard_level" class="inline-block text-[9px] font-bold px-[5px] py-[1px] rounded-full ml-1 align-middle"
                                           :class="guardBadgeClass(item.guard_level)">{{ guardLabel(item.guard_level) }}</span>
                                 </div>
-                                <div class="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                <!-- 按用户合并：列出该用户的每一个礼物（多行）全部显示 -->
+                                <div v-if="eMergeUser && item._gifts && item._gifts.length" class="mt-1 space-y-1">
+                                    <div class="flex items-center gap-1 font-semibold text-[11px]">
+                                        <span>礼物清单</span>
+                                        <span class="gift-value" v-if="eShowPrice" style="margin-left:auto; background:rgba(255,215,0,0.28)">总额 ¥{{ Number(item.actual_value).toFixed(1) }}</span>
+                                    </div>
+                                    <div v-for="(g, gi) in item._gifts" :key="gi"
+                                         class="flex items-center gap-1.5 text-xs">
+                                        <img v-if="g.gift_icon" :src="proxyImg(g.gift_icon)" class="gift-icon mini"
+                                             @error="$event.target.style.display='none'">
+                                        <span class="text-white/80 truncate flex-1">{{ g.gift_name }} × {{ g.gift_num }}</span>
+                                        <span class="gift-value" v-if="eShowPrice && g.actual_value">¥{{ Number(g.actual_value).toFixed(1) }}</span>
+                                    </div>
+                                    <div v-if="item._gift_total" class="text-[10px] text-white/50 pt-0.5 border-t border-white/10">
+                                        共 {{ item._gifts.length }} 种礼物 · {{ item._gift_total }} 件
+                                    </div>
+                                </div>
+                                <!-- 普通模式：单条礼物 -->
+                                <div v-else class="flex items-center gap-1.5 mt-0.5 flex-wrap">
                                     <span class="text-xs text-white/80">投喂了 {{ item.gift_name }} × {{ item.gift_num }}</span>
-                                    <span class="gift-value" v-if="item.actual_value">¥{{ Number(item.actual_value).toFixed(1) }}</span>
+                                    <span class="gift-value" v-if="eShowPrice && item.actual_value">¥{{ Number(item.actual_value).toFixed(1) }}</span>
                                     <span class="gift-time" v-if="item.ts && !eMergeGifts">{{ fmtDateTime(item.ts, eSelectedDates.length > 1) }}</span>
                                 </div>
                             </div>
-                            <img v-if="item.gift_icon" :src="proxyImg(item.gift_icon)" class="gift-icon"
+                            <img v-if="item.gift_icon && !eMergeUser" :src="proxyImg(item.gift_icon)" class="gift-icon"
                                  @error="$event.target.style.display='none'">
                         </div>
                     </div>
@@ -5101,7 +5637,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
                 <div v-show="configSections.features">
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 text-sm">
                     <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.welcome_enabled" class="w-4 h-4"> 欢迎</label>
+                    <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.guard_welcome_enabled" class="w-4 h-4"> 大航海欢迎</label>
                     <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.thanks_enabled" class="w-4 h-4"> 感谢</label>
+                    <div class="flex items-center gap-1 text-[11px] text-gray-400 col-span-2 sm:col-span-2">大航海欢迎：仅舰长/提督/总督进房时用专属模板欢迎，与「欢迎」相互独立，可只开大航海欢迎</div>
 
                     <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.blindbox_enabled" class="w-4 h-4"> 盲盒统计</label>
                     <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.guard_thanks_enabled" class="w-4 h-4"> 大航海感谢</label>
@@ -5116,6 +5654,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     <label class="flex items-center gap-2" v-if="roomConfig.features.llm_bare_trigger"><input type="checkbox" v-model="roomConfig.features.llm_keyword_trigger" class="w-4 h-4"> 包含关键词触发AI</label>
                     <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.use_chinese_numbers_global" class="w-4 h-4"> 全局大写数字（反屏蔽）</label>
                     <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.pk_report_enabled" class="w-4 h-4"> ⚔️ PK汇报</label>
+                    <label class="flex items-center gap-2"><input type="checkbox" v-model="roomConfig.features.run_when_not_live" class="w-4 h-4"> 未开播也运行</label>
+                    <div class="flex items-center gap-1 text-[11px] text-gray-400 col-span-2 sm:col-span-2">未开播也运行：未开播时也保持弹幕连接并正常发送消息（测试用，开启后永不断连）</div>
                 </div>
                 <div class="text-xs text-gray-400 mb-2">免#指令：开启后可不带 # 使用指令（签到、今日盲盒等） | AI免#：弹幕开头匹配唤醒词即触发AI | 包含关键词：弹幕含唤醒词即触发AI（需AI免#前缀唤醒）</div>
                 <div v-if="roomConfig.features.danmaku_log_enabled" class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -5233,10 +5773,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
                             <span class="text-gray-400 text-[10px]">支持占位符: {uname}用户名</span>
                         </label>
                     </div>
-                    <h4 class="text-xs font-bold text-gray-600 mt-2">大航海欢迎（优先级高于默认欢迎模板）</h4>
+                    <h4 class="text-xs font-bold text-gray-600 mt-2">🛳️ 大航海欢迎（仅舰长/提督/总督，优先级高于默认欢迎模板）</h4>
                     <div class="border rounded p-3 bg-gray-50 flex items-center justify-between">
-                        <span class="text-xs text-gray-500">📋 多模板（随机+时段）共 {{ guardWelcomeTotal }} 条</span>
-                        <button @click="openGuardWelcomeTplModal" class="bg-blue-50 hover:bg-blue-100 text-blue-600 px-2.5 py-1 rounded text-xs font-medium">✏️ 编辑</button>
+                        <label class="flex items-center gap-2 text-xs text-gray-600"><input type="checkbox" v-model="roomConfig.features.guard_welcome_enabled" class="w-4 h-4"> 开启大航海欢迎</label>
+                        <button @click="openGuardWelcomeTplModal" class="bg-blue-50 hover:bg-blue-100 text-blue-600 px-2.5 py-1 rounded text-xs font-medium">✏️ 编辑模板</button>
                     </div>
                     <label class="text-xs text-gray-500 block">连接消息
                         <input type="text" v-model="roomConfig.features.connected_message" placeholder="来了喵~" class="border p-2 rounded w-full text-sm mt-1">
@@ -5776,7 +6316,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <div v-if="roomSubTab==='danmaku'" class="max-w-full sm:max-w-4xl mx-auto">
             <div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm space-y-4">
                 <div class="flex items-center justify-between">
-                    <h2 class="text-lg font-bold">💬 弹幕记录</h2>
+                    <h2 class="gb-card-title text-lg font-bold">💬 弹幕记录</h2>
                     <div class="flex items-center gap-2">
                         <button @click="dmExportSelected" class="bg-green-500 hover:bg-green-600 text-white px-3 py-2 rounded text-sm">📤 导出CSV</button>
                         <button @click="clearDanmakuLog" class="bg-red-500 hover:bg-red-600 text-white px-3 py-2 rounded text-sm">清空</button>
@@ -5784,17 +6324,112 @@ INDEX_HTML = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- 日期选择 + 排序 -->
-                <div class="relative flex items-center gap-2 flex-wrap">
-                    <button @click="dmShowCal = !dmShowCal" class="border p-2 rounded text-sm bg-white">
-                        {{ dmSelectedDates.size ? '已选 '+dmSelectedDates.size+' 天' : '点击选择日期' }}
-                        <span v-if="dmDateFrom && dmDateTo && dmDateFrom !== dmDateTo" class="text-gray-400 ml-1">({{ dmDateFrom }} ~ {{ dmDateTo }})</span>
-                        <span v-else-if="dmDateFrom" class="text-gray-400 ml-1">({{ dmDateFrom }})</span>
-                    </button>
-                    <button @click="dmAsc = !dmAsc; loadDanmakuLog()" class="border p-2 rounded text-sm bg-white hover:bg-gray-50" :title="dmAsc ? '旧到新' : '新到旧'">
-                        {{ dmAsc ? '📅 旧→新' : '📅 新→旧' }}
-                    </button>
-                    <span class="text-xs text-gray-400">{{ dmDates.length }} 天有数据，点击日期可多选</span>
+                <!-- 工具区：时间范围 / 搜索 / 用户 / 场次 分组排列 -->
+                <div class="relative">
+                    <div class="dm-toolbar rounded-xl border border-gray-200 bg-gray-50/60 divide-y divide-gray-100">
+                        <!-- 时间范围 + 排序 -->
+                        <div class="dm-toolbar-row flex items-start gap-3 px-3 py-2 flex-wrap">
+                            <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">时间范围</span>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <button @click="dmShowCal = !dmShowCal" class="border px-3 py-2 rounded text-sm bg-white hover:bg-gray-50">
+                                    {{ dmSelectedDates.size ? '已选 '+dmSelectedDates.size+' 天' : '点击选择日期' }}
+                                    <span v-if="dmDateFrom && dmDateTo && dmDateFrom !== dmDateTo" class="text-gray-400 ml-1">({{ dmDateFrom }} ~ {{ dmDateTo }})</span>
+                                    <span v-else-if="dmDateFrom" class="text-gray-400 ml-1">({{ dmDateFrom }})</span>
+                                </button>
+                                <button @click="dmAsc = !dmAsc; loadDanmakuLog()" class="border px-3 py-2 rounded text-sm bg-white hover:bg-gray-50" :title="dmAsc ? '旧到新' : '新到旧'">
+                                    {{ dmAsc ? '📅 旧→新' : '📅 新→旧' }}
+                                </button>
+                            </div>
+                            <span class="text-xs text-gray-400 self-center ml-auto">{{ dmDates.length }} 天有数据，点击日期可多选</span>
+                        </div>
+                        <!-- 搜索 + 录像 -->
+                        <div class="dm-toolbar-row flex items-start gap-3 px-3 py-2 flex-wrap">
+                            <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">搜索</span>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <div class="flex items-center gap-1">
+                                    <input type="text" v-model="dmKeyword" placeholder="🔍 搜索用户名/内容"
+                                           class="border p-2 rounded text-sm w-52 bg-white focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                           @keyup.enter="dmSearch" @keyup.esc="clearDmSearch">
+                                    <button @click="dmSearch" class="bg-blue-500 hover:bg-blue-600 text-white px-3 py-2 rounded text-sm whitespace-nowrap">搜索</button>
+                                    <button v-if="dmSearchActive" @click="clearDmSearch" class="px-2 py-2 rounded text-sm text-gray-500 hover:bg-gray-100" title="清除搜索">✕</button>
+                                </div>
+                                <div class="flex items-center gap-2 pl-2 border-l border-gray-200">
+                                    <span class="text-xs text-gray-400">相邻弹幕间隔更大</span>
+                                    <select v-model="dmGap" @change="restartSessions" class="border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300" title="两条相邻弹幕间隔超过该时长即视为新的一场录像">
+                                        <option v-for="o in dmGapOptions" :key="o.v" :value="o.v">{{ o.label }}</option>
+                                    </select>
+                                    <span class="text-xs text-gray-400">算新录像</span>
+                                    <label class="flex items-center gap-1 text-sm text-gray-600 cursor-pointer select-none" title="显示/隐藏弹幕对应的录像时间列">
+                                        <input type="checkbox" v-model="dmShowRec" class="accent-purple-600"> 显示弹幕对应的录像时间
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- 用户筛选 + 统计 -->
+                        <div class="dm-toolbar-row flex items-start gap-3 px-3 py-2 flex-wrap">
+                            <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">用户</span>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <select v-model="dmUserFilter" @change="dmUidFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuUsers(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats();"
+                                        class="border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 max-w-[200px]" title="按用户名筛选(模糊)">
+                                    <option value="">全部用户</option>
+                                    <option v-for="u in dmUsers" :key="u.uid" :value="u.uname">{{ u.uname }} ({{ u.count }})</option>
+                                </select>
+                                <input type="text" v-model="dmUidFilter" placeholder="UID 精确筛选"
+                                       class="border px-2 py-2 rounded text-sm bg-white w-36 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                       @keyup.enter="dmUserFilter=''; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuSessions(); if(dmShowStats) loadDanmakuStats()">
+                                <button v-if="dmUserFilter || dmUidFilter" @click="clearDmFilters" class="px-2 py-1.5 rounded text-xs text-gray-500 hover:bg-gray-100" title="清除用户/UID筛选">✕</button>
+                                <button @click="dmShowStats = !dmShowStats; if(dmShowStats) loadDanmakuStats()"
+                                        class="border px-3 py-2 rounded text-sm bg-white hover:bg-gray-50"
+                                        :class="dmShowStats ? 'ring-2 ring-blue-300 bg-blue-50 text-blue-700' : ''">📊 弹幕统计</button>
+                            </div>
+                        </div>
+                        <!-- 直播场次 -->
+                        <div class="dm-toolbar-row flex items-start gap-3 px-3 py-2 flex-wrap">
+                            <span class="dm-toolbar-label w-16 shrink-0 text-xs text-gray-400 leading-8">场次</span>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <div class="relative dm-sess-picker">
+                                    <button @click.prevent="dmToggleSessionPanel"
+                                            class="dm-sess-trigger border px-2 py-2 rounded text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300 whitespace-nowrap"
+                                            title="搜索并选择某一场直播查看其弹幕,替代按日期选择">
+                                        <span v-if="dmSessionIdx < 0" class="text-gray-400">全部(按日期)</span>
+                                        <span v-else class="text-gray-800">{{ dmSessCurLabel }}</span>
+                                        <span class="text-gray-400 ml-1">▾</span>
+                                    </button>
+                                    <!-- 可搜索场次列表面板 -->
+                                    <div v-if="dmShowSessionPanel"
+                                         class="absolute top-full left-0 mt-1 w-80 bg-white border rounded-xl shadow-lg z-50 flex flex-col"
+                                         @click.stop>
+                                        <div class="p-2 border-b border-gray-100">
+                                            <input v-model="dmSessionQuery" type="text" placeholder="🔍 搜索日期/时间段/条数…"
+                                                   class="w-full border p-2 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                                   @keyup.esc="dmShowSessionPanel=false">
+                                        </div>
+                                        <div class="max-h-64 overflow-y-auto py-1">
+                                            <button v-for="(s,i) in dmSessionFiltered" :key="s.start"
+                                                    @click="dmPickSession(i)"
+                                                    class="w-full text-left px-3 py-2 hover:bg-blue-50 text-sm transition-colors"
+                                                    :class="i === dmSessionIdx ? 'bg-blue-50 text-blue-700' : 'text-gray-700'">
+                                                <div class="flex items-center justify-between">
+                                                    <span class="font-medium">场次{{ i+1 }}</span>
+                                                    <span class="text-xs text-gray-400">{{ dmSessionLabel(s) }}</span>
+                                                </div>
+                                                <div class="flex items-center justify-between mt-0.5">
+                                                    <span class="text-xs text-purple-600 font-mono">{{ s.count }} 条</span>
+                                                    <span v-if="i === dmSessionIdx" class="text-blue-600 text-xs">✓ 已选</span>
+                                                </div>
+                                            </button>
+                                            <div v-if="!dmSessionFiltered.length" class="px-3 py-6 text-center text-sm text-gray-400">没有匹配的场次</div>
+                                        </div>
+                                        <div class="p-2 border-t border-gray-100">
+                                            <button @click="dmPickSession(-1)" class="w-full text-center text-sm text-gray-500 hover:text-blue-600 py-1">↺ 全部(按日期)</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button v-if="dmSessionIdx >= 0" @click="dmSessionIdx=-1; danmakuOffset=0; loadDanmakuLog(); loadDanmakuSessions(changed=true)" class="px-2 py-1.5 rounded text-xs text-gray-500 hover:bg-gray-100" title="清除场次筛选,回到按日期">✕</button>
+                                <button @click="loadDanmakuSessions(true)" class="border px-3 py-2 rounded text-sm bg-white hover:bg-gray-50" title="重新加载直播场次列表">⟳ 刷新场次</button>
+                            </div>
+                        </div>
+                    </div>
                     <div v-if="dmShowCal" @click.stop class="absolute top-full left-0 mt-1 bg-white border rounded-xl shadow-lg z-50 p-3 w-[300px]">
                         <div class="flex justify-between items-center mb-2">
                             <button @click="dmCalMonth--" class="px-2 py-1 hover:bg-gray-100 rounded text-sm">&lt;</button>
@@ -5817,37 +6452,96 @@ INDEX_HTML = r"""<!DOCTYPE html>
                         <div class="flex justify-between mt-3 pt-2 border-t border-gray-100">
                             <button @click="dmSelectedDates = new Set(); dmShowCal = false" class="text-xs text-gray-500 hover:text-gray-700">取消</button>
                             <span class="text-[10px] text-gray-400 leading-5">蓝色=有数据，点击多选</span>
-                            <button @click="dmShowCal = false; loadDanmakuLog()" class="text-xs bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">✅ 确认</button>
+                            <button @click="dmShowCal = false; danmakuOffset=0; dmSessionIdx=-1; loadDanmakuLog(); loadDanmakuSessions()" class="text-xs bg-blue-500 text-white px-3 py-1 rounded hover:bg-blue-600">✅ 确认</button>
                         </div>
                     </div>
                 </div>
 
                 <div v-if="danmakuErr" class="text-red-500 text-sm">{{ danmakuErr }}</div>
 
+                <!-- 弹幕统计面板 -->
+                <div v-if="dmShowStats && dmStats" class="dm-stats-card mb-3 p-4">
+                    <div class="gb-card-title text-sm font-bold text-blue-800 mb-3">📊 弹幕统计</div>
+                    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center mb-3">
+                        <div class="bg-white rounded-xl p-3 shadow-sm">
+                            <div class="text-xl font-bold text-blue-700">{{ dmStats.total }}</div>
+                            <div class="text-[10px] text-gray-400 mt-0.5">弹幕总数</div>
+                        </div>
+                        <div class="bg-white rounded-xl p-3 shadow-sm">
+                            <div class="text-xl font-bold text-blue-700">{{ dmStats.distinct_users }}</div>
+                            <div class="text-[10px] text-gray-400 mt-0.5">发言用户数</div>
+                        </div>
+                        <div class="bg-white rounded-xl p-3 shadow-sm">
+                            <div class="text-xl font-bold text-purple-600">{{ dmStats.top_users.length }}</div>
+                            <div class="text-[10px] text-gray-400 mt-0.5">活跃TOP</div>
+                        </div>
+                        <div class="bg-white rounded-xl p-3 shadow-sm">
+                            <div class="text-xl font-bold text-amber-600">{{ dmStats.hours.length }}</div>
+                            <div class="text-[10px] text-gray-400 mt-0.5">活跃小时段</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                        <div>
+                            <div class="font-semibold text-gray-700 mb-1.5">🏆 发言最活跃 TOP{{ Math.min(5, dmStats.top_users.length) }} 用户</div>
+                            <div class="space-y-1">
+                                <div v-for="(u,i) in dmStats.top_users.slice(0,5)" :key="u.uid"
+                                     class="flex items-center justify-between bg-white rounded-lg px-2.5 py-1.5 shadow-sm">
+                                    <span class="text-gray-700"><b class="text-amber-500">{{ i+1 }}.</b> {{ u.uname }}</span>
+                                    <span class="text-gray-500 font-medium">{{ u.count }} 条</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="font-semibold text-gray-700 mb-1.5">🕐 逐小时活跃分布</div>
+                            <div class="space-y-1.5">
+                                <div v-for="h in dmStats.hours" :key="h.hour" class="flex items-center gap-2">
+                                    <span class="w-10 text-gray-500 text-right">{{ String(h.hour).padStart(2,'0') }}:00</span>
+                                    <div class="flex-1 bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                                        <div class="h-full bg-gradient-to-r from-blue-500 to-purple-500 rounded-full" :style="'width:'+ barPct(h.count) + '%'"></div>
+                                    </div>
+                                    <span class="text-gray-400 w-8 text-left">{{ h.count }}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- 弹幕表格 -->
                 <div v-if="danmakuRows.length" class="overflow-x-auto">
-                    <table class="w-full text-sm">
-                        <thead><tr class="bg-gray-50 sticky top-0"><th class="p-2 text-left">时间</th><th class="p-2 text-left">用户</th><th class="p-2 text-left">UID</th><th class="p-2 text-left">内容</th></tr></thead>
-                        <tbody>
-                            <tr v-for="r in danmakuRows" :key="r.id" class="border-t hover:bg-gray-50">
-                                <td class="p-2 whitespace-nowrap text-xs text-gray-500">{{ fmtDanmakuTime(r.ts) }}</td>
-                                <td class="p-2 font-medium">{{ r.uname }}</td>
-                                <td class="p-2 text-xs text-gray-400">{{ r.uid }}</td>
-                                <td class="p-2 max-w-xs truncate">{{ r.content }}</td>
-                            </tr>
-                        </tbody>
-                    </table>
+                    <div v-if="dmSearchActive" class="flex items-center gap-2 mb-3 text-xs bg-blue-50 text-blue-700 px-3 py-2 rounded-lg">
+                        <span>🔎 正在搜索「{{ dmSearchActive }}」</span>
+                        <span class="text-blue-400">匹配 {{ danmakuTotal }} 条</span>
+                        <button @click="clearDmSearch" class="ml-auto hover:underline">清除搜索</button>
+                    </div>
+                    <div class="dm-table-wrap">
+                        <table class="gb-table w-full text-sm">
+                            <thead><tr><th v-if="dmShowRec" class="p-2 text-left">录像时间</th><th class="p-2 text-left">时间</th><th class="p-2 text-left">用户</th><th class="p-2 text-left">UID</th><th class="p-2 text-left">内容</th></tr></thead>
+                            <tbody>
+                                <tr v-for="(r,ri) in danmakuRows" :key="r.id" class="align-top"
+                                    :class="{'bg-purple-50/60': ri>0 && dmShowRec && danmakuRows[ri-1].sess !== r.sess}">
+                                    <td v-if="dmShowRec" class="p-2 whitespace-nowrap">
+                                        <span v-if="ri===0 || danmakuRows[ri-1].sess !== r.sess" class="dm-sess-badge mb-1">🎬 第 {{ r.sess }} 场</span>
+                                        <div class="text-xs dm-rel-time">{{ fmtRelTime(r.rel) }}</div>
+                                    </td>
+                                    <td class="p-2 whitespace-nowrap text-xs text-gray-500">{{ fmtDanmakuTime(r.ts) }}</td>
+                                    <td class="p-2 font-medium whitespace-nowrap" v-html="highlightDanmaku(r.uname)"></td>
+                                    <td class="p-2 text-xs text-gray-400 whitespace-nowrap">{{ r.uid }}</td>
+                                    <td class="p-2 whitespace-pre-wrap break-words min-w-[200px] max-w-xl" v-html="highlightDanmaku(r.content)"></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
                     <div class="flex items-center justify-between mt-4 text-sm">
                         <div class="text-gray-500">共 {{ danmakuTotal }} 条</div>
                         <div class="flex gap-2 items-center">
                             <button @click="danmakuOffset = Math.max(0, danmakuOffset - danmakuLimit)"
                                     :disabled="danmakuOffset === 0"
-                                    class="px-3 py-1 rounded border text-sm"
+                                    class="dm-page-btn px-3 py-1 rounded border text-sm"
                                     :class="danmakuOffset === 0 ? 'text-gray-300 cursor-not-allowed' : 'hover:bg-gray-100'">上一页</button>
                             <span class="text-gray-500">第 {{ danmakuPage }} 页</span>
                             <button @click="danmakuOffset += danmakuLimit"
                                     :disabled="danmakuOffset + danmakuLimit >= danmakuTotal"
-                                    class="px-3 py-1 rounded border text-sm"
+                                    class="dm-page-btn px-3 py-1 rounded border text-sm"
                                     :class="danmakuOffset + danmakuLimit >= danmakuTotal ? 'text-gray-300 cursor-not-allowed' : 'hover:bg-gray-100'">下一页</button>
                         </div>
                     </div>
@@ -5863,7 +6557,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <!-- ══════ 全局配置 ══════ -->
 <div v-if="tab==='global'" class="max-w-3xl mx-auto">
     <div class="bg-white p-6 rounded-xl shadow-sm space-y-4">
-        <h2 class="text-lg font-bold">⚙️ 全局配置</h2>
+        <h2 class="page-title">⚙️ 全局配置</h2>
         <div class="text-sm space-y-2">
             <div class="flex items-center gap-2">
                 <span class="text-gray-500">Web 端口:</span>
@@ -5883,7 +6577,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <!-- ══════ 预设模板 ══════ -->
     <div class="bg-white p-6 rounded-xl shadow-sm space-y-4 mt-4">
         <div class="flex items-center justify-between">
-            <h2 class="text-lg font-bold">📋 预设模板</h2>
+            <h2 class="page-title">📋 预设模板</h2>
             <div class="flex gap-2">
                 <button @click="showAddTemplate = 'llm'" class="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1.5 rounded text-xs">➕ AI模板</button>
                 <button @click="showAddTemplate = 'bot'" class="bg-green-500 hover:bg-green-600 text-white px-3 py-1.5 rounded text-xs">➕ 机器人模板</button>
@@ -5947,7 +6641,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <!-- ══════ 全局控制 ══════ -->
     <div class="bg-white p-6 rounded-xl shadow-sm space-y-4 mt-4">
-        <h2 class="text-lg font-bold">🔄 全局控制</h2>
+        <h2 class="page-title">🔄 全局控制</h2>
         <div class="flex flex-wrap gap-3 items-center">
             <button @click="restartAllBots" :disabled="restartingAll"
                     class="bg-yellow-500 hover:bg-yellow-600 text-white px-5 py-2 rounded text-sm">
@@ -5962,8 +6656,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div v-if="tab==='users'" class="max-w-full sm:max-w-3xl mx-auto px-2 sm:px-0">
     <div class="bg-white p-4 sm:p-6 rounded-xl shadow-sm space-y-4">
         <div class="flex items-center justify-between">
-            <h2 class="text-lg font-bold">👥 用户管理</h2>
-            <button @click="openAddUser" class="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded text-sm">➕ 添加用户</button>
+            <h2 class="page-title">👥 用户管理</h2>
+            <button @click="openAddUser" class="bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white px-4 py-2 rounded-xl text-sm shadow-md shadow-emerald-200/50 transition active:scale-[0.98]">➕ 添加用户</button>
         </div>
 
         <div v-if="showUserForm" class="border rounded-lg p-4 bg-gray-50 space-y-3">
@@ -6099,15 +6793,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
 </div>
 <div v-if="tab==='help'" class="max-w-3xl mx-auto">
-    <div class="bg-white p-6 rounded-xl shadow-sm space-y-6 text-sm leading-relaxed">
-        <h2 class="text-lg font-bold">📖 使用指南</h2>
+    <div class="help-page bg-white p-6 rounded-xl shadow-sm space-y-6 text-sm leading-relaxed">
+        <h2 class="page-title">📖 使用指南</h2>
         <!-- 官网入口：放在最显眼的位置（下载、功能说明、常见问题都在上面） -->
         <a href="https://ayabot.jianke-yu.online" target="_blank" rel="noopener"
            class="flex items-center gap-3 bg-gradient-to-r from-pink-50 to-sky-50 border border-pink-200 rounded-lg p-3 hover:border-pink-300 transition no-underline">
             <span class="text-2xl shrink-0">🌐</span>
             <span class="flex-1 min-w-0">
-                <span class="block font-bold text-[13px] sm:text-sm text-gray-800 break-words">官网 · ayabot.jianke-yu.online</span>
+                <span class="block font-bold text-[13px] sm:text-sm text-gray-800 break-words">原作者官网 · ayabot.jianke-yu.online</span>
                 <span class="block text-xs text-gray-500 mt-0.5">最新版下载（国内线路自动测速）、功能说明、常见问题</span>
+            </span>
+            <span class="hidden sm:inline text-xs text-blue-500 whitespace-nowrap shrink-0">打开 ↗</span>
+        </a>
+        <!-- 本版本链接：与官网卡片同样式 -->
+        <a href="https://github.com/MildewD/Ayabot_2" target="_blank" rel="noopener"
+           class="flex items-center gap-3 bg-gradient-to-r from-pink-50 to-sky-50 border border-pink-200 rounded-lg p-3 hover:border-pink-300 transition no-underline">
+            <span class="text-2xl shrink-0">🌐</span>
+            <span class="flex-1 min-w-0">
+                <span class="block font-bold text-[13px] sm:text-sm text-gray-800 break-words">本版本 · github.com/MildewD/Ayabot_2</span>
+                <span class="block text-xs text-gray-500 mt-0.5">本版本源码、功能说明、常见问题</span>
             </span>
             <span class="hidden sm:inline text-xs text-blue-500 whitespace-nowrap shrink-0">打开 ↗</span>
         </a>
@@ -6121,44 +6825,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
             </ol>
         </div>
         <div>
-            <h3 class="font-bold text-blue-600 mb-1">🎯 弹幕命令</h3>
-            <table class="w-full text-xs border-collapse">
-                <thead><tr class="bg-gray-100"><th class="border p-1 text-left">命令</th><th class="border p-1 text-left">说明</th></tr></thead>
+            <h3 class="font-bold text-slate-700 mb-2 flex items-center gap-1.5"><span class="gb-card-title">🎯 弹幕命令</span></h3>
+            <div class="rounded-xl border border-slate-100 bg-white/40 overflow-hidden">
+            <table class="w-full text-xs border-collapse gb-table">
+                <thead><tr><th class="p-2 text-left">命令</th><th class="p-2 text-left">说明</th></tr></thead>
                 <tbody>
-                    <tr><td class="border p-1"><code>#签到</code></td><td class="border p-1">每日签到（直播场次连续签到）</td></tr>
-                    <tr><td class="border p-1"><code>#抽签</code></td><td class="border p-1">今日运势抽签（支持自定义签文）</td></tr>
-                    <tr><td class="border p-1"><code>#今日盲盒:用户名</code></td><td class="border p-1">今日盲盒统计，不加用户名查自己</td></tr>
-                    <tr><td class="border p-1"><code>#本月盲盒:用户名</code></td><td class="border p-1">本月盲盒统计，不加用户名查自己</td></tr>
-                    <tr><td class="border p-1"><code>#&lt;唤醒词&gt; &lt;聊天&gt;</code></td><td class="border p-1">AI 智能回复</td></tr>
-                    <tr><td class="border p-1"><code>#帮助</code></td><td class="border p-1">显示所有命令</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#签到</code></td><td class="p-2 text-gray-600">每日签到（直播场次连续签到）</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#抽签</code></td><td class="p-2 text-gray-600">今日运势抽签（支持自定义签文）</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#今日盲盒:用户名</code></td><td class="p-2 text-gray-600">今日盲盒统计，不加用户名查自己</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#本月盲盒:用户名</code></td><td class="p-2 text-gray-600">本月盲盒统计，不加用户名查自己</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#&lt;唤醒词&gt; &lt;聊天&gt;</code></td><td class="p-2 text-gray-600">AI 智能回复</td></tr>
+                    <tr><td class="p-2"><code class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold">#帮助</code></td><td class="p-2 text-gray-600">显示所有命令</td></tr>
                 </tbody>
             </table>
+            </div>
             <p class="text-xs text-gray-400 mt-2">开启「免#指令」后可不带 # 前缀触发指令。
             开启「AI免#前缀唤醒」后弹幕以唤醒词开头即触发 AI。</p>
-        </div>
-        <div class="pt-4 border-t border-gray-200">
-            <p class="text-xs text-gray-400 text-center">
-                <a href="https://ayabot.jianke-yu.online" target="_blank" rel="noopener" class="text-blue-500 hover:underline">🌐 官网</a>
-                <span class="mx-1">·</span>
-                <a href="https://github.com/yujianke100/ayabot" target="_blank" rel="noopener" class="text-blue-500 hover:underline">⭐ 去 GitHub 给个 Star</a>
-                <span class="mx-1">·</span>
-                本软件<span class="text-red-500 font-bold">完全免费</span>，以 GPLv3 协议开源
-                <span class="block mt-1" data-ayabot-version="__AYABOT_VERSION__">Ayabot __AYABOT_VERSION__</span>
-                <button @click="checkUpdate" class="mt-3 w-full sm:w-auto bg-blue-50 hover:bg-blue-100 text-blue-600 font-medium px-5 py-2.5 rounded-lg text-sm">🔍 检查更新</button>
-            </p>
-            <div class="mt-4 pt-4 border-t border-gray-100 text-center">
-                <p class="text-xs text-gray-500 mb-3">☕ 觉得好用？请作者喝杯咖啡吧 ❤️</p>
-                <div class="flex justify-center gap-6">
-                    <div class="text-center">
-                        <img src="/figs/alipay.jpg" width="150" height="150" alt="支付宝" class="rounded-xl border inline-block">
-                        <p class="text-xs text-gray-400 mt-1">支付宝</p>
-                    </div>
-                    <div class="text-center">
-                        <img src="/figs/wechat.png" width="150" height="150" alt="微信" class="rounded-xl border inline-block">
-                        <p class="text-xs text-gray-400 mt-1">微信</p>
-                    </div>
-                </div>
-            </div>
         </div>
     </div>
 </div>
@@ -6258,6 +6940,24 @@ createApp({
         const tab = ref('rooms');
         const userRole = ref('');
         const mustResetPwd = ref(false);
+
+        // 夜间模式（与 <html>.dark 同步）
+        const isDark = ref(false);
+        function initTheme() {
+            try {
+                isDark.value = localStorage.getItem('ayabot_dark') === '1';
+            } catch (e) { /* 无痕 */ }
+        }
+        function toggleTheme() {
+            isDark.value = !isDark.value;
+            document.documentElement.classList.toggle('dark', isDark.value);
+            try {
+                localStorage.setItem('ayabot_dark', isDark.value ? '1' : '0');
+            } catch (e) { /* 无痕 */ }
+        }
+        initTheme();
+        // 让当前渲染状态与 <html> 保持同步（防页面硬刷新后 Vue 状态与 class 脱节）
+        document.documentElement.classList.toggle('dark', isDark.value);
 
         // 修改密码
         const showChangePwd = ref(false);
@@ -6369,8 +7069,10 @@ createApp({
         const eType = ref('all');
         const eSort = ref('uname');
         const eMergeGifts = ref(false);
+        const eMergeUser = ref(false);
         const ePerCol = ref(6);
         const eColWidth = ref(340);
+        const eShowPrice = ref(true);
         const exportList = ref([]);
         const exporting = ref(false);
         const loadingExport = ref(false);
@@ -6455,6 +7157,54 @@ createApp({
                 }
             }
 
+            // ══ 按用户合并：同一用户所有礼物整合成一张卡片 ══
+            if (eMergeUser.value) {
+                const byUser = new Map();
+                for (const item of items) {
+                    const k = item.uid;
+                    if (!byUser.has(k)) {
+                        byUser.set(k, {
+                            ...item,
+                            _gifts: [{
+                                gift_name: item.gift_name,
+                                gift_num: item.gift_num || 0,
+                                actual_value: item.actual_value || 0,
+                                gift_icon: item.gift_icon || '',
+                            }],
+                            _gift_total: item.gift_num || 0,
+                        });
+                    } else {
+                        const ex = byUser.get(k);
+                        // 同一礼物名在聚合卡片内再累加一次
+                        const dup = ex._gifts.find(g => g.gift_name === item.gift_name);
+                        if (dup) {
+                            dup.gift_num += (item.gift_num || 0);
+                            dup.actual_value += (item.actual_value || 0);
+                        } else {
+                            ex._gifts.push({
+                                gift_name: item.gift_name,
+                                gift_num: item.gift_num || 0,
+                                actual_value: item.actual_value || 0,
+                                gift_icon: item.gift_icon || '',
+                            });
+                        }
+                        ex._gift_total += (item.gift_num || 0);
+                        ex.ts = Math.max(ex.ts, item.ts);
+                    }
+                }
+                items = [...byUser.values()].map(u => {
+                    const tv = u._gifts.reduce((s, g) => s + (g.actual_value || 0), 0);
+                    return { ...u, actual_value: tv, _gift_total: u._gift_total, _gifts: u._gifts };
+                });
+                // 排序：大航海优先，再按总价值/时间
+                items.sort((a, b) => {
+                    const g = (b.guard_level || 0) - (a.guard_level || 0);
+                    if (g) return g;
+                    if (s === 'ts') return (a.ts || 0) - (b.ts || 0);
+                    return (b.actual_value || 0) - (a.actual_value || 0);
+                });
+            }
+
             const cols = [];
             for (let i = 0; i < items.length; i += perCol) {
                 cols.push(items.slice(i, i + perCol));
@@ -6491,6 +7241,29 @@ createApp({
         const dmDateFrom = ref('');
         const dmDateTo = ref('');
         const dmAsc = ref(false);
+        const dmKeyword = ref('');
+        const dmSearchActive = ref('');
+        const dmSearchCount = ref(0);
+        const dmGap = ref(14400);   // 录像划分间隔阈值(秒)，相邻弹幕间隔≥该值视为新录像；默认4小时
+        const dmShowRec = ref(true); // 是否显示「录像」列
+        const dmGapOptions = [
+            { v: 3600, label: '1 小时' },
+            { v: 7200, label: '2 小时' },
+            { v: 14400, label: '4 小时(默认)' },
+            { v: 28800, label: '8 小时' },
+            { v: 43200, label: '12 小时' },
+        ];
+        // 用户名 / UID 筛选 + 弹幕统计
+        const dmUsers = ref([]);            // 去重用户列表(从 /api/danmaku_users 加载)
+        const dmUserFilter = ref('');        // 选中的用户名(模糊筛选)
+        const dmUidFilter = ref('');         // 精确 UID 筛选输入
+        const dmUserBusy = ref(false);       // 用户下拉加载中
+        const dmStats = ref(null);           // 统计结果
+        const dmShowStats = ref(false);      // 统计面板显隐
+        const dmSessions = ref([]);          // 直播场次列表(从 /api/danmaku_sessions 加载)
+        const dmSessionIdx = ref(-1);        // 选中的场次索引(-1=不按场次,按日期)
+        const dmShowSessionPanel = ref(false); // 可搜索场次面板开关
+        const dmSessionQuery = ref('');        // 场次面板搜索词
         const dmCalDays = Vue.computed(() => {
             const y = dmCalYear.value, m = dmCalMonth.value;
             const fd = new Date(y, m, 1).getDay();
@@ -7009,6 +7782,7 @@ createApp({
                 dmSelectedDates.value = new Set();
                 loadDmDates();
                 loadDanmakuLog();
+                loadDanmakuSessions();
             }
             if (key === 'export') {
                 loadUserDates();
@@ -7762,7 +8536,15 @@ createApp({
             let df = '', dt = '';
             if (sel.length) { df = sel[0]; dt = sel[sel.length-1]; }
             dmDateFrom.value = df; dmDateTo.value = dt;
-            const url = `/api/danmaku_log?room_id=${roomId}&limit=${danmakuLimit.value}&offset=${danmakuOffset.value}&date_from=${df}&date_to=${dt}&asc=${dmAsc.value ? 1 : 0}`;
+            // 场次查看模式：选中的场次用其精确时间戳范围过滤，替代日期参数
+            let st = '', en = '';
+            let tsdf = df, tsdt = dt;
+            if (dmSessionIdx.value >= 0) {
+                const s = dmSessions.value[dmSessionIdx.value];
+                if (s) { st = String(s.start); en = String(s.end); }
+            }
+            const kw = dmSearchActive.value ? encodeURIComponent(dmSearchActive.value) : '';
+            const url = `/api/danmaku_log?room_id=${roomId}&limit=${danmakuLimit.value}&offset=${danmakuOffset.value}&date_from=${tsdf}&date_to=${tsdt}&asc=${dmAsc.value ? 1 : 0}&keyword=${kw}&gap_sec=${dmGap.value}&start_ts=${st}&end_ts=${en}&uid=${dmUidFilter.value ? encodeURIComponent(dmUidFilter.value) : ''}&uname=${dmUserFilter.value ? encodeURIComponent(dmUserFilter.value) : ''}`;
             try {
                 const res = await fetch(url, {credentials: 'include'});
                 if (res.status === 401) { loggedIn.value = false; return; }
@@ -7771,6 +8553,158 @@ createApp({
                 danmakuRows.value = data.rows || [];
                 danmakuTotal.value = data.total || 0;
             } catch(e) { danmakuErr.value = '加载失败: ' + e.message; }
+        }
+        // 弹幕搜索：从第一页开始按关键词过滤
+        function dmSearch() {
+            const kw = dmKeyword.value.trim();
+            if (!kw && !dmSearchActive.value) return;
+            if (kw === dmSearchActive.value) return;
+            dmSearchActive.value = kw || '';
+            danmakuOffset.value = 0;
+            loadDanmakuLog();
+        }
+        function clearDmSearch() {
+            if (!dmSearchActive.value) return;
+            dmSearchActive.value = '';
+            dmKeyword.value = '';
+            danmakuOffset.value = 0;
+            loadDanmakuLog();
+        }
+        // —— 场次查看：直接选某一场直播看弹幕 ——
+        function dmSessionLabel(s) {
+            if (!s) return '';
+            const z = (n) => String(n).padStart(2, '0');
+            const d = new Date((s.start + (s.utc ? 0 : 0)) * 1000);
+            return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
+        }
+        function dmSessionChanged() {
+            danmakuOffset.value = 0;
+            loadDanmakuLog();
+            if (dmShowStats.value) loadDanmakuStats();
+        }
+        // 可搜索场次：按查询词过滤（匹配 场次号/日期时间/条数）
+        const dmSessionFiltered = computed(() => {
+            const q = (dmSessionQuery.value || '').trim().toLowerCase();
+            if (!q) return dmSessions.value;
+            return dmSessions.value.filter((s, i) => {
+                const label = dmSessionLabel(s).toLowerCase();
+                return ('场次' + (i + 1)).toLowerCase().includes(q)
+                    || label.includes(q)
+                    || String(s.count).includes(q);
+            });
+        });
+        // 触发按钮上当前场次的展示标签
+        const dmSessCurLabel = computed(() => {
+            if (dmSessionIdx.value < 0) return '';
+            const s = dmSessions.value[dmSessionIdx.value];
+            return s ? `场次${dmSessionIdx.value + 1} · ${dmSessionLabel(s)} · ${s.count}条` : '';
+        });
+        function dmToggleSessionPanel() {
+            dmShowSessionPanel.value = !dmShowSessionPanel.value;
+            if (dmShowSessionPanel.value) dmSessionQuery.value = '';
+        }
+        // 从面板选中某场(-1=全部) 或点搜索框外关闭时共用
+        function dmPickSession(i) {
+            dmShowSessionPanel.value = false;
+            dmSessionQuery.value = '';
+            if (i === dmSessionIdx.value) return;
+            dmSessionIdx.value = i;
+            dmSessionChanged();
+        }
+        async function loadDanmakuSessions() {
+            const roomId = selectedRoom.value?.room_id;
+            if (!roomId) return;
+            const df = dmDateFrom.value, dt = dmDateTo.value;
+            const kw = dmSearchActive.value ? encodeURIComponent(dmSearchActive.value) : '';
+            const uid = dmUidFilter.value ? encodeURIComponent(dmUidFilter.value) : '';
+            const uname = dmUserFilter.value ? encodeURIComponent(dmUserFilter.value) : '';
+            try {
+                const res = await fetch(`/api/danmaku_sessions?room_id=${roomId}&date_from=${df}&date_to=${dt}&keyword=${kw}&gap_sec=${dmGap.value}&uid=${uid}&uname=${uname}`, {credentials: 'include'});
+                if (!res.ok) return;
+                const data = await res.json();
+                dmSessions.value = data.sessions || [];
+                if (dmSessionIdx.value >= dmSessions.value.length) dmSessionIdx.value = -1;
+            } catch(e) { dmSessions.value = []; }
+        }
+        // 加载去重用户列表(供用户筛选下拉)，随日期/关键词变化刷新
+        async function loadDanmakuUsers() {
+            const roomId = selectedRoom.value?.room_id;
+            if (!roomId) return;
+            const df = dmDateFrom.value, dt = dmDateTo.value;
+            const kw = dmSearchActive.value ? encodeURIComponent(dmSearchActive.value) : '';
+            const {st, en} = dmSessionTs();
+            try {
+                const res = await fetch(`/api/danmaku_users?room_id=${roomId}&date_from=${df}&date_to=${dt}&keyword=${kw}&start_ts=${st}&end_ts=${en}`, {credentials: 'include'});
+                if (!res.ok) return;
+                const data = await res.json();
+                dmUsers.value = data.users || [];
+            } catch(e) { dmUsers.value = []; }
+        }
+        // 取当前选中场次的 ts 范围（未选时为空）
+        function dmSessionTs() {
+            if (dmSessionIdx.value >= 0) {
+                const s = dmSessions.value[dmSessionIdx.value];
+                if (s) return { st: String(s.start), en: String(s.end) };
+            }
+            return { st: '', en: '' };
+        }
+        // 加载弹幕统计
+        async function loadDanmakuStats() {
+            const roomId = selectedRoom.value?.room_id;
+            if (!roomId) return;
+            const df = dmDateFrom.value, dt = dmDateTo.value;
+            const kw = dmSearchActive.value ? encodeURIComponent(dmSearchActive.value) : '';
+            const uid = dmUidFilter.value ? encodeURIComponent(dmUidFilter.value) : '';
+            const uname = dmUserFilter.value ? encodeURIComponent(dmUserFilter.value) : '';
+            const {st, en} = dmSessionTs();
+            try {
+                const res = await fetch(`/api/danmaku_stats?room_id=${roomId}&date_from=${df}&date_to=${dt}&keyword=${kw}&start_ts=${st}&end_ts=${en}&uid=${uid}&uname=${uname}`, {credentials: 'include'});
+                if (!res.ok) return;
+                const data = await res.json();
+                dmStats.value = data.stats || null;
+            } catch(e) { dmStats.value = null; }
+        }
+        // 统计条形图百分比(相对最多的小时段，撑满 100%)
+        function barPct(c) {
+            const hours = (dmStats.value && dmStats.value.hours) || [];
+            const max = hours.reduce((a,h) => Math.max(a, h.count), 1) || 1;
+            return Math.min(100, Math.round((c / max) * 100));
+        }
+        // 清空用户名/UID 筛选
+        function clearDmFilters() {
+            dmUserFilter.value = '';
+            dmUidFilter.value = '';
+            danmakuOffset.value = 0;
+            loadDanmakuLog();
+            loadDanmakuUsers();
+            if (dmShowStats.value) loadDanmakuStats();
+        }
+        // 弹幕高亮: 用 <mark> 包裹关键词 (v-html), 转义 HTML 防止注入
+        function highlightDanmaku(text) {
+            if (text == null) return '';
+            const safe = String(text).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+            const kw = dmSearchActive.value;
+            if (!kw) return safe;
+            let re;
+            try { re = new RegExp(`(${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'); }
+            catch { return safe; }
+            return safe.replace(re, '<mark style="background:#fde68a;color:#92400e;border-radius:2px;padding:0 1px">$1</mark>');
+        }
+        // 录像相对播放时间: 秒 -> H:MM:SS (不足1小时只显示 MM:SS)
+        function fmtRelTime(rel) {
+            if (rel == null || rel < 0) return '';
+            rel = Math.floor(rel);
+            const h = Math.floor(rel / 3600);
+            const m = Math.floor((rel % 3600) / 60);
+            const s = rel % 60;
+            const mm = String(m).padStart(2, '0');
+            const ss = String(s).padStart(2, '0');
+            return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+        }
+        // 录像划分间隔阈值改变: 重置到第一页重载
+        function restartSessions() {
+            danmakuOffset.value = 0;
+            loadDanmakuLog();
         }
         async function dmExportSelected() {
             const rid = selectedRoom.value?.room_id;
@@ -9082,6 +10016,7 @@ createApp({
         return {showUpdateModal, updateChecking, updateError, updateData, checkUpdate, viewChangelog, showChangelog, changelogContent, renderMarkdown,
                 updateNotice, openUpdateNotice, ignoreUpdate, silentCheckUpdate,
                 loggedIn, loginUser, loginPass, loginErr, doLogin, doLogout,
+                isDark, toggleTheme,
                 tab, userRole,
                 showUserMenu, showChangePwd, changePwdOld, changePwdNew, changePwdNewUser, changePwdMsg, changePwdOk, changingPwd,
                 mustResetPwd,
@@ -9095,7 +10030,7 @@ createApp({
                 loadExport, gotoExport, loadUserDates, onUidInput, onModeChange,
                 toggleDate, selectAllDatesInRange, clearSelectedDates, applyMultiDateExport,
                 pickDate, captureExport, eModeAll, eSelectedDates, eSelectedSet,
-                eMergeGifts, exporting, startingRooms, fmtDateTime,
+                eMergeGifts, eMergeUser, eShowPrice, exporting, startingRooms, fmtDateTime,
                 showCalendar, calYear, calMonth, calDays, exportDatesSet,
                 proxyImg, fmtTime, cardBgClass, guardLabel, guardBadgeClass,
                 delDate, delResult, confirmDelete,
@@ -9103,6 +10038,13 @@ createApp({
                 apiMsg, apiMsgOk, loadRoomApiConfig, toggleRoomApi, regenerateRoomApiKey, copyText,
                 danmakuRows, danmakuErr, danmakuOffset, danmakuLimit, danmakuTotal, danmakuPage,
                 loadDanmakuLog, clearDanmakuLog, fmtDanmakuTime, loadDmDates, dmToggleDate, dmExportSelected, dmCalDays, dmCalYear, dmCalMonth, dmShowCal, dmSelectedDates, dmDates, dmDatesSet, dmAsc,
+                dmKeyword, dmSearchActive, dmSearch, clearDmSearch, highlightDanmaku,
+                dmGap, dmShowRec, dmGapOptions, fmtRelTime, restartSessions,
+                dmUsers, dmUserFilter, dmUidFilter, dmUserBusy, dmStats, dmShowStats,
+                dmSessions, dmSessionIdx, dmSessionLabel, dmSessionChanged, loadDanmakuSessions, dmSessionTs,
+                dmShowSessionPanel, dmSessionQuery, dmSessionFiltered, dmSessCurLabel,
+                dmToggleSessionPanel, dmPickSession,
+                loadDanmakuUsers, loadDanmakuStats, clearDmFilters, barPct,
                 llmEnabled, llmProvider, llmApiKey, llmBaseUrl, llmModel, llmPrompt,
                 showMsTip, msPicked, applyModelScope,
                 llmWakeWord, llmTemp, llmTopP, llmMaxTokens,

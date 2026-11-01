@@ -10,6 +10,7 @@ credential:
 features:
   welcome_enabled: true
   welcome_template: "欢迎 {uname} 来到直播间喵~"
+  guard_welcome_enabled: true   # 大航海欢迎独立开关（舰长/提督/总督进房专属欢迎，与欢迎互不依赖，可只开它）
   thanks_enabled: true
   thanks_template: "感谢 {uname} 送出的 {gift_name} x{gift_num}"
   blindbox_enabled: true
@@ -30,6 +31,7 @@ features:
   periodic_message_interval_seconds: 600
   periodic_message_template: "点个关注不迷路喵~"
   pk_report_enabled: true           # PK开始/结束时汇报对手信息
+  run_when_not_live: false          # 未开播也运行：未开播时也保持弹幕连接并正常发消息（测试用，开启后永不断连）
   pk_report_template: "PK开始！对手{opponent}，{fans}粉，{guards}，{audience}观众，贡献{score}"
   pk_end_template: "{result} 我方分数{score}"       # {result}结果(胜利！/对方获胜/PK结束) {score}我方分数
   like_thanks_enabled: true        # 点赞感谢开关

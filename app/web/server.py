@@ -4945,8 +4945,6 @@ div[class*="fixed inset-0 bg-black/40"] { backdrop-filter: blur(6px); -webkit-ba
             </div>
             <div class="mt-6 pt-5 border-t border-slate-100 text-center">
                 <p class="text-xs text-slate-400">
-                    <a href="https://github.com/yujianke100/ayabot" target="_blank" class="text-indigo-500 hover:underline">⭐ GitHub</a>
-                    <span class="mx-1">·</span>
                     <span class="text-rose-500 font-bold">完全免费</span> · 开源
                     <span class="block mt-1">Ayabot __AYABOT_VERSION__</span>
                 </p>
